@@ -20,17 +20,17 @@ blocks are rendered.
 - **True-size images, no upscaling**: images render at their natural pixel
   size; with `fit_window = true` (default) oversized images are scaled down
   to fit the window, never up.
-- **neorg-nabla compatible options**: `render_on_enter`, `debounce_ms`,
-  `conceal_math_tags`.
-- **Concealing**: block source lines are concealed under the image (requires
-  `conceallevel >= 2`); moving the cursor into a block reveals the raw LaTeX
-  and hides the image, moving out re-conceals.
+- **neorg-nabla compatible options**: `render_on_enter`, `debounce_ms`.
+- **Visible source, image beside it**: the LaTeX source is never hidden;
+  each formula renders on reserved virtual lines directly below (default)
+  or above the block (`position` option).
 - **Disk cache**: one PNG per unique formula (keyed by snippet + backend +
   foreground color), shared across sessions.
 
 ## Requirements
 
-- Neovim >= 0.10 (whole-row `@math`/`@end` tag hiding needs >= 0.11)
+- Neovim >= 0.10 (reserving virtual lines above the block needs >= 0.11;
+  with the default `position = "below"`, 0.10 works too)
 - [neorg](https://github.com/nvim-neorg/neorg)
 - [image.nvim](https://github.com/3rd/image.nvim) with a working backend
   (kitty/sixel/ueberzug) for your terminal
@@ -72,8 +72,8 @@ In a norg buffer:
 :Neorg render-math toggle
 ```
 
-Then make sure `conceallevel >= 2` in the window (`setlocal conceallevel=2`),
-otherwise the raw LaTeX stays visible instead of the image.
+Images appear as soon as the backend conversion finishes; the LaTeX source
+itself is never hidden.
 
 ## Configuration
 
@@ -88,10 +88,9 @@ All options (defaults shown):
     -- Milliseconds to wait after the last text change before re-rendering.
     debounce_ms = 200,
 
-    -- Hide the `@math` / `@end` tag lines as well (conceallevel >= 2).
-    -- Whole-row hiding needs Neovim >= 0.11; on 0.10 the tags fall back to
-    -- blank (character-concealed) rows.
-    conceal_math_tags = false,
+    -- Where the image is rendered relative to the math block:
+    -- "below" (default) or "above".
+    position = "below",
 
     -- LaTeX-to-PNG backends in preference order. The first backend whose
     -- probe succeeds is used.
@@ -105,7 +104,8 @@ All options (defaults shown):
     dpi = 350,
 
     -- Foreground color as "#rrggbb". nil = foreground of the
-    -- `@norg.rendered.latex` highlight group (fallback: black).
+    -- `@norg.rendered.latex` highlight group (following its link, so it
+    -- tracks your colorscheme; fallback: black).
     foreground_color = nil,
 
     -- Background of rendered formulas: "transparent" or "#rrggbb".
@@ -216,28 +216,23 @@ top-level environments (`align`, `gather`, `multline`, ...) are passed
 through as-is; second-level environments (`pmatrix`, `cases`, ...) are
 wrapped in `\[ ... \]`.
 
-## How concealing works
+## How rendering works
 
-- With `conceallevel >= 2`, every content line of a rendered block is
-  concealed character-by-character, so the image replaces the source in place.
-- The block's vertical space tracks the image: if the rendered image is
-  taller than the source lines, filler lines push following text down; if it
-  is shorter (Neovim >= 0.11), the surplus source lines are hidden entirely
-  (whole-row conceal) instead of leaving blank rows. On Neovim 0.10 surplus
-  lines fall back to blank screen rows.
-- When the cursor moves onto a block's line, that block's image is hidden and
-  the raw source revealed; leaving the block restores the image.
+- The LaTeX source of a math block is never hidden: the formula image is
+  an addition rendered on reserved virtual lines directly below (default)
+  or directly above the block.
+- The reservation tracks the image height exactly, so following text is
+  pushed down by the image height and no blank rows are left behind.
 - If the same buffer is displayed in multiple windows, every window gets
   its own rendered images (new splits pick them up automatically, closed
   windows drop theirs).
-- With `conceal_math_tags = true`, the `@math` / `@end` lines are hidden
-  entirely (Neovim >= 0.11 uses whole-row `conceal_lines` hiding).
 - Images wiped by floating UI recover automatically: command line float
   (`CmdlineLeave`), any closing window incl. notification popups
   (`WinClosed`), or a manual `doautocmd User NeorgMathRendererRedraw` /
   `public.redraw()`.
-- Rendering is skipped entirely when `conceallevel < 2`, since the image
-  would just overlap visible source text.
+- The foreground color tracks `@norg.rendered.latex` (including its link
+  target) and is re-resolved on `ColorScheme`, so formulas follow your
+  colorscheme automatically.
 
 ## Testing
 
@@ -252,8 +247,8 @@ verification in a real neorg session.
 
 ## Troubleshooting
 
-- **No rendering**: check `:Neorg render-math` is enabled, `conceallevel >= 2`,
-  and that `:lua print(vim.inspect(require("neorg.modules").get_module("external.math-renderer").public.get_backend()))`
+- **No rendering**: check `:Neorg render-math` is enabled, and that
+  `:lua print(vim.inspect(require("neorg.modules").get_module("external.math-renderer").public.get_backend()))`
   prints a backend name instead of `nil`.
 - **Conversion errors** are notified at most once every 30 seconds per
   backend; stale temp artifacts live under `<cache_dir>/tmp/` and can be

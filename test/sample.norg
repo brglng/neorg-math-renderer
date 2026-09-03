@@ -1,6 +1,6 @@
 @document.meta
 title: neorg-math-renderer manual test
-description: Math blocks of every supported shape. Open with conceallevel=2 and run :Neorg render-math enable
+description: Math blocks of every supported shape. Run :Neorg render-math enable
 authors:
 - neorg-math-renderer
 @end
@@ -67,10 +67,11 @@ x^2 & \text{if } x \ge 0 \\
 \text{Euler: } e^{i\pi} + 1 = 0 \qquad \alpha \oplus \beta \otimes \gamma
 @end
 
-* Multi-line raw source (conceal check)
+* Multi-line raw source (position check)
 
-The block below has its LaTeX spread over multiple buffer lines; all lines
-should be concealed under the single rendered image.
+The block below has its LaTeX spread over multiple buffer lines; the image
+renders below the block (or above with `position = "above"`), with no blank
+rows left behind regardless of the source line count.
 
 @math
 \sum_{k=1}^{n} k^2
@@ -79,9 +80,10 @@ should be concealed under the single rendered image.
 \sum_{k=1}^{n} k^3 = \left(\frac{n(n+1)}{2}\right)^2
 @end
 
-* Cursor behavior checklist
+* Checklist
 
-1. Move the cursor onto a rendered block: the raw source appears, the image
-   hides. Move away: the image returns.
-2. Set @conceallevel=0: rendering stops (raw source everywhere).
-3. Try `:Neorg render-math disable` / `toggle` and watch everything clear.
+1. The LaTeX source always stays visible; the image renders below the block
+   (or above with `position = "above"`), never covering the code.
+2. `:Neorg render-math disable` / `toggle` clears and restores everything.
+3. Change your colorscheme: formulas should re-render with the new
+   foreground color (from `@norg.rendered.latex` or `foreground_color`).
