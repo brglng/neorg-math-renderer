@@ -121,13 +121,18 @@ module.private = {
 }
 
 --- Compute the foreground color and push the user configuration into the
---- backends module.
-local function configure_backends()
+--- Recompute the formula foreground from the active colorscheme. Mirrors
+--- core.latex.renderer: read `@neorg.rendered.latex` (the editor resolves
+--- its link for us) and fall back to 50% grey when the group has no
+--- definition. An explicit `foreground_color` config always wins.
+local function compute_foreground()
 	local hex = module.config.public.foreground_color
 	if not hex then
-		local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = "@norg.rendered.latex", link = false })
-		if ok and type(hl) == "table" and hl.fg then
+		local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = "@neorg.rendered.latex", link = false })
+		if ok and type(hl) == "table" and not vim.tbl_isempty(hl) and hl.fg then
 			hex = ("#%06x"):format(hl.fg)
+		else
+			hex = "#808080" -- 50% grey, same fallback core.latex.renderer uses
 		end
 	end
 
@@ -624,22 +629,21 @@ local function show_hidden(buf)
 end
 
 local function colorscheme_changed()
-	-- The foreground color is part of the cache key, so stale images are
-	-- invalidated automatically; just forget the in-memory copies.
-	configure_backends()
-	for _, state in pairs(module.private.blocks) do
-		for _, entry in pairs(state) do
-			clear_image(entry)
-			entry.png = nil
-		end
-	end
-	if module.private.do_render then
-		for buf in pairs(module.private.blocks) do
+	-- Aligned with core.latex.renderer: drop every cached conversion, then
+	-- recompute the foreground and re-render on the next tick, once the new
+	-- scheme's highlights are in place.
+	vim.schedule(function()
+		compute_foreground()
+		for buf, state in pairs(module.private.blocks) do
 			if vim.api.nvim_buf_is_valid(buf) then
+				for _, entry in pairs(state) do
+					deactivate_entry(buf, entry)
+					entry.png = nil
+				end
 				schedule_render(buf, 0)
 			end
 		end
-	end
+	end)
 end
 
 --------------------------------------------------------------------------------
@@ -688,7 +692,12 @@ local event_handlers = {
 
 function module.on_event(event)
 	if event.referrer == "core.autocommands" then
-		if not vim.api.nvim_buf_is_valid(event.buffer) or vim.bo[event.buffer].ft ~= "norg" then
+		-- ColorScheme is global (not tied to a buffer): it must be processed
+		-- even when the current buffer is not a norg file.
+		local is_colorscheme = event.type == "core.autocommands.events.colorscheme"
+		if not is_colorscheme
+			and (not vim.api.nvim_buf_is_valid(event.buffer) or vim.bo[event.buffer].ft ~= "norg")
+		then
 			return
 		end
 	end
@@ -737,7 +746,7 @@ module.load = function()
 	-- render_on_enter implies rendering starts enabled (mirrors core.latex.renderer).
 	module.private.do_render = module.config.public.render_on_enter == true
 
-	configure_backends()
+	compute_foreground()
 
 	-- Resolve the rendering backend once; empty result means nothing usable.
 	module.private.backend = backends.resolve(module.config.public.backends)
@@ -751,15 +760,29 @@ module.load = function()
 	end
 
 	-- Enable the autocmds this module reacts to.
-	for _, name in ipairs({ "BufReadPost", "BufWinEnter", "WinEnter", "CursorMoved", "TextChanged", "InsertLeave", "Colorscheme" }) do
+	for _, name in ipairs({ "BufReadPost", "BufWinEnter", "WinEnter", "CursorMoved", "TextChanged", "InsertLeave" }) do
 		module.required["core.autocommands"].enable_autocommand(name)
 	end
+	-- ColorScheme is NOT a buffer event: its match field is the colorscheme
+	-- name, so the default "*.norg" isolation would make it never fire.
+	-- Pass dont_isolate = true (same as neorg's own core.highlights does).
+	module.required["core.autocommands"].enable_autocommand("Colorscheme", true)
 
 	-- Float-based command-line UIs (e.g. noice.nvim) repaint the screen when
 	-- the command line opens and closes, wiping the terminal cells the images
 	-- were drawn on. image.nvim does not redraw on its own (no scroll or
 	-- topline change), so refresh once the command line is left.
 	local aug = vim.api.nvim_create_augroup("neorg-math-renderer", { clear = true })
+
+	-- `set background=light/dark` changes the resolved foreground without a
+	-- ColorScheme event (e.g. when only a scheme's variant is toggled).
+	vim.api.nvim_create_autocmd("OptionSet", {
+		group = aug,
+		pattern = "background",
+		callback = function()
+			colorscheme_changed()
+		end,
+	})
 	vim.api.nvim_create_autocmd({ "CmdlineLeave", "CmdwinLeave" }, {
 		group = aug,
 		callback = function()

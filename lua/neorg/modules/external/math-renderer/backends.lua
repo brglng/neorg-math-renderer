@@ -168,14 +168,20 @@ local function hex_to_rgb(hex)
 	return tonumber(hex:sub(1, 2), 16) or 0, tonumber(hex:sub(3, 4), 16) or 0, tonumber(hex:sub(5, 6), 16) or 0
 end
 
---- Background argument for dvipng: keyword or "rgb R G B".
+--- Convert a hex color to dvipng's normalized RGB syntax. Unlike ratex,
+--- dvipng expects each RGB component in the 0..1 range, not 0..255.
+local function dvipng_rgb_arg(hex)
+	local r, g, b = hex_to_rgb(hex)
+	return ("rgb %.6f %.6f %.6f"):format(r / 255, g / 255, b / 255)
+end
+
+--- Background argument for dvipng: keyword or normalized RGB.
 local function dvipng_bg_arg()
 	local bg = M.background()
 	if bg == "transparent" then
 		return "Transparent"
 	end
-	local r, g, b = hex_to_rgb(bg)
-	return ("rgb %d %d %d"):format(r, g, b)
+	return dvipng_rgb_arg(bg)
 end
 
 --- Convert one snippet with the ratex-render CLI.
@@ -405,7 +411,6 @@ local function render_latex(snippet, key, done)
 		end
 
 		local png = dir .. "/math.png"
-		local r, g, b = hex_to_rgb(M.foreground_hex())
 		run({
 			"dvipng",
 			"-D",
@@ -415,7 +420,7 @@ local function render_latex(snippet, key, done)
 			"-bg",
 			dvipng_bg_arg(),
 			"-fg",
-			("rgb %d %d %d"):format(r, g, b),
+			dvipng_rgb_arg(M.foreground_hex()),
 			"-o",
 			png,
 			"math.dvi",
@@ -435,6 +440,10 @@ local converters = {
 	latex = render_latex,
 }
 
+-- Bump when generated PNG semantics change. This invalidates old files
+-- generated with the pre-normalized dvipng RGB arguments.
+local CACHE_VERSION = "v2-dvipng-normalized-rgb"
+
 --------------------------------------------------------------------------------
 -- public conversion API with disk cache
 --------------------------------------------------------------------------------
@@ -443,7 +452,7 @@ local converters = {
 ---@param backend string
 ---@return string cache key
 local function cache_key(snippet, backend)
-	return vim.fn.sha256(backend .. "\0" .. M.foreground_hex() .. "\0" .. snippet)
+	return vim.fn.sha256(CACHE_VERSION .. "\0" .. backend .. "\0" .. M.foreground_hex() .. "\0" .. snippet)
 end
 
 ---@param key string
