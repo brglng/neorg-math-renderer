@@ -52,10 +52,10 @@ module.config.public = {
 	-- Milliseconds to wait after the last text change before re-rendering.
 	debounce_ms = 200,
 
-	-- When true, the `@math` and `@end` tag lines of math blocks are concealed
-	-- (hidden when conceallevel >= 2). Whole-row hiding needs Neovim >= 0.11;
-	-- older versions fall back to character-level conceal (blank tag rows).
-	conceal_math_tags = false,
+	-- Where to render the formula image relative to the math block:
+	-- "below" (default) or "above". The block's source stays fully
+	-- visible; the image occupies reserved virtual lines next to it.
+	position = "below",
 
 	-- LaTeX-to-PNG backends in preference order. The first backend whose
 	-- executables are found is used for every block.
@@ -109,23 +109,16 @@ module.private = {
 	do_render = false,
 
 	--- Per-buffer block state: bufnr -> { [math_row] = entry }.
-	--- Each entry: { math_row, erow, indent, anchor_row, snippet, png,
-	---               images (winid -> image), conceal_ids, tag_ids,
-	---               surplus_ids, filler_id, shown, pending }
+	--- Each entry: { math_row, erow, indent, snippet, has_content, png,
+	---               images (winid -> image), reservation_id, shown, pending }
 	blocks = {},
 
 	--- Per-buffer debounce timer handles.
 	timers = {},
 
-	--- Whether the whole-row `conceal_lines` warning has been shown.
-	row_hide_notified = false,
-
 	--- Last time an error was notified per backend (throttle).
 	last_error_notify = {},
 }
-
---- Whether whole-row conceal (`conceal_lines`) is supported by this Neovim.
-local row_hide_supported = vim.fn.has("nvim-0.11") == 1
 
 --- Compute the foreground color and push the user configuration into the
 --- backends module.
@@ -209,21 +202,10 @@ local function get_math_blocks(buf)
 
 			local tag_line = vim.api.nvim_buf_get_lines(buf, math_row, math_row + 1, false)[1] or ""
 
-			-- Anchor the image at the first non-blank content line: a blank
-			-- first line would give the column anchor nothing to hold on to.
-			local anchor_row = math_row + 1
-			for i, l in ipairs(lines) do
-				if l:match("%S") then
-					anchor_row = math_row + i
-					break
-				end
-			end
-
 			entries[math_row] = {
 				math_row = math_row,
 				erow = erow,
 				indent = #((tag_line:match("^(%s*)")) or ""),
-				anchor_row = anchor_row,
 				snippet = snippet,
 				has_content = snippet ~= "" and erow > math_row + 1,
 			}
@@ -234,99 +216,6 @@ local function get_math_blocks(buf)
 	return entries
 end
 
---- Is the cursor row "inside" `entry`? With conceal_math_tags the tag rows
---- count as inside too, mirroring neorg-nabla.
----@param entry table
----@param cursor_row integer 0-based
----@return boolean
-local function cursor_inside(entry, cursor_row)
-	if module.config.public.conceal_math_tags then
-		return cursor_row >= entry.math_row and cursor_row <= entry.erow
-	end
-	return cursor_row > entry.math_row and cursor_row < entry.erow
-end
-
---------------------------------------------------------------------------------
--- concealment
---------------------------------------------------------------------------------
-
---- Conceal the source text of one line. `from_col` leaves leading columns
---- visible: on the anchor row the block's indentation must stay visible,
---- because nvim computes screen columns with concealed ranges as zero-width
---- -- concealing across the anchor column would shift the image left onto
---- column 0 instead of the block's indent.
-local function hide_line(buf, entry, r, from_col)
-	local line = vim.api.nvim_buf_get_lines(buf, r, r + 1, false)[1] or ""
-	local start_col = math.min(from_col or 0, #line)
-	if start_col >= #line then
-		return
-	end
-	local id = vim.api.nvim_buf_set_extmark(buf, module.private.ns, r, start_col, {
-		end_row = r,
-		end_col = #line,
-		conceal = "",
-		strict = false,
-		undo_restore = false,
-		invalidate = true,
-	})
-	if id then
-		table.insert(entry.conceal_ids, id)
-	end
-end
-
---- Whole-row conceal a tag row on nvim >= 0.11; character-level fallback
---- with a one-time notice on 0.10.
-local function hide_row(buf, entry, r)
-	if row_hide_supported then
-		local id = vim.api.nvim_buf_set_extmark(buf, module.private.ns, r, 0, {
-			end_row = r,
-			conceal_lines = "",
-			strict = false,
-			undo_restore = false,
-			invalidate = true,
-		})
-		if id then
-			table.insert(entry.tag_ids, id)
-		end
-	else
-		if not module.private.row_hide_notified then
-			module.private.row_hide_notified = true
-			vim.notify_once(
-				"neorg-math-renderer: whole-row tag hiding needs Neovim >= 0.11; "
-					.. "conceal_math_tags falls back to blank tag rows",
-				vim.log.levels.WARN
-			)
-		end
-		hide_line(buf, entry, r)
-	end
-end
-
---- Remove all concealment extmarks belonging to `entry`.
-local function clear_concealment(buf, entry)
-	for _, id in ipairs(entry.conceal_ids) do
-		vim.api.nvim_buf_del_extmark(buf, module.private.ns, id)
-	end
-	for _, id in ipairs(entry.tag_ids) do
-		vim.api.nvim_buf_del_extmark(buf, module.private.ns, id)
-	end
-	for _, id in ipairs(entry.surplus_ids) do
-		vim.api.nvim_buf_del_extmark(buf, module.private.ns, id)
-	end
-	entry.conceal_ids = {}
-	entry.tag_ids = {}
-	entry.surplus_ids = {}
-	if entry.filler_id then
-		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, entry.filler_id)
-		entry.filler_id = nil
-	end
-end
-
---------------------------------------------------------------------------------
--- image management
---------------------------------------------------------------------------------
-
---- Destroy all image objects of `entry` (one per window displaying the
---- buffer).
 local function clear_image(entry)
 	for win, img in pairs(entry.images or {}) do
 		pcall(function()
@@ -334,6 +223,17 @@ local function clear_image(entry)
 		end)
 		entry.images[win] = nil
 	end
+end
+
+--- Terminal rows an image with `px` pixel height occupies.
+local function px_to_rows(px)
+	local ok_term, term = pcall(function()
+		return require("image.utils.term").get_size()
+	end)
+	if ok_term and term and term.cell_height and px and px > 0 then
+		return math.max(1, math.floor(px / term.cell_height))
+	end
+	return 1
 end
 
 --- Terminal rows the rendered image occupies: prefer the height reported
@@ -357,50 +257,18 @@ local function image_rows(img)
 	return 1
 end
 
---- Whole-row conceal a surplus source row (below the rendered image). No
---- fallback on nvim < 0.11: the row keeps occupying a blank screen row there.
---- NOTE: surplus rows never coexist with filler virt_lines (surplus exists
---- only when the image is SHORTER than the content, filler only when it is
---- taller), so the nvim 0.12 conceal_lines + virt_lines viewport quirk seen
---- in neorg-nabla cannot trigger here.
-local function hide_surplus_row(buf, entry, r)
-	if not row_hide_supported then
+--- Reserve the screen rows the image occupies: virtual lines directly
+--- above ("above") or below ("below") the block. The source stays fully
+--- visible; nothing is concealed.
+local function update_reservation(buf, entry)
+	if entry.reservation_id then
+		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, entry.reservation_id)
+		entry.reservation_id = nil
+	end
+	if not next(entry.images) then
 		return
 	end
-	local id = vim.api.nvim_buf_set_extmark(buf, module.private.ns, r, 0, {
-		end_row = r,
-		conceal_lines = "",
-		strict = false,
-		undo_restore = false,
-		invalidate = true,
-	})
-	if id then
-		table.insert(entry.surplus_ids, id)
-	end
-end
 
---- Sync the vertical layout of `entry` with the rendered image size:
---- 1. the concealed content rows provide `covered` screen rows under the
----    image;
---- 2. when the image is taller, the remainder is added as virt_lines on the
----    last content row (mirrors neorg-nabla);
---- 3. when the image is shorter, the surplus content rows are hidden
----    entirely (whole-row conceal) instead of leaving blank rows.
---- This replaces image.nvim's own virtual padding, which would reserve the
---- FULL image height on top of the concealed source rows and produce
---- surplus blank lines.
-local function update_layout(buf, entry)
-	if entry.filler_id then
-		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, entry.filler_id)
-		entry.filler_id = nil
-	end
-	for _, id in ipairs(entry.surplus_ids) do
-		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, id)
-	end
-	entry.surplus_ids = {}
-
-	-- Filler/surplus are buffer-wide; size them for the tallest per-window
-	-- rendering so no window's image overlaps following text.
 	local rows = 0
 	for _, img in pairs(entry.images) do
 		rows = math.max(rows, image_rows(img))
@@ -408,21 +276,22 @@ local function update_layout(buf, entry)
 	if rows == 0 then
 		return
 	end
-	local covered = entry.erow - entry.anchor_row
 
-	-- image shorter than the content: vanish the surplus source rows
-	for r = entry.anchor_row + rows, entry.erow - 1 do
-		hide_surplus_row(buf, entry, r)
+	local filler = {}
+	for _ = 1, rows do
+		filler[#filler + 1] = { { "", "" } }
 	end
 
-	-- image taller than the content: top up the remainder
-	local extra = rows - covered
-	if extra > 0 then
-		local filler = {}
-		for _ = 1, extra do
-			filler[#filler + 1] = { { "", "" } }
-		end
-		entry.filler_id = vim.api.nvim_buf_set_extmark(buf, module.private.ns, entry.erow - 1, 0, {
+	if module.config.public.position == "above" then
+		entry.reservation_id = vim.api.nvim_buf_set_extmark(buf, module.private.ns, entry.math_row, 0, {
+			virt_lines = filler,
+			virt_lines_above = true,
+			strict = false,
+			undo_restore = false,
+			invalidate = true,
+		})
+	else
+		entry.reservation_id = vim.api.nvim_buf_set_extmark(buf, module.private.ns, entry.erow, 0, {
 			virt_lines = filler,
 			strict = false,
 			undo_restore = false,
@@ -431,30 +300,25 @@ local function update_layout(buf, entry)
 	end
 end
 
---- Create and render the image of `entry` bound to window `win` from its
---- cached PNG. image.nvim binds an image to a single window, so every
---- window displaying the buffer gets its own object (from_file clones the
---- cached processed image, so this is cheap).
 local function create_image(buf, entry, win)
 	if not module.private.image or not entry.png or entry.images[win] then
 		return
 	end
 
-	local ok, img = pcall(module.private.image.from_file, entry.png, {
+		-- The image is anchored OUTSIDE the block, on its reserved virtual
+		-- lines: "below" sits on the lines reserved after @end, "above"
+		-- covers the lines reserved before @math (render_offset_top shifts
+		-- it up by its own height, set right after creation).
+		position = module.config.public.position
+		y = (position == "above") and entry.math_row or entry.erow
+
+		local ok, img = pcall(module.private.image.from_file, entry.png, {
 		window = win,
 		buffer = buf,
 		inline = true,
-		-- Space is managed by this module: the concealed content rows provide
-		-- the screen rows they occupy, and update_filler() tops up the
-		-- remainder. image.nvim's own padding would reserve the FULL image
-		-- height on top of those rows, producing surplus blank lines.
 		with_virtual_padding = false,
 		x = entry.indent,
-		y = entry.anchor_row,
-		-- Without virtual padding the renderer lands the image one terminal
-		-- row low; -1 compensates (same compensation core.integrations.image
-		-- uses for inline math without padding).
-		render_offset_top = -1,
+		y = y,
 		-- Native size by default: image.nvim's global max_*_window_percentage
 		-- defaults (100% width / 50% height) must never shrink block images.
 		-- 100000% effectively disables both caps; `fit_window` restores sane
@@ -463,11 +327,16 @@ local function create_image(buf, entry, win)
 		max_height_window_percentage = module.config.public.fit_window and 100 or 100000,
 	})
 	if ok and img then
+		if position == "above" then
+			img.render_offset_top = -(px_to_rows(img.image_height) + 1)
+		else
+			img.render_offset_top = 0
+		end
 		entry.images[win] = img
 		pcall(function()
 			img:render()
 		end)
-		update_layout(buf, entry)
+		update_reservation(buf, entry)
 	end
 end
 
@@ -506,16 +375,16 @@ end
 -- per-entry apply / reveal
 --------------------------------------------------------------------------------
 
---- Hide `entry`'s image and reveal the raw source.
-local function reveal_entry(buf, entry)
+--- Deactivate `entry`: drop its images and its row reservation.
+local function deactivate_entry(buf, entry)
 	entry.shown = false
 	clear_image(entry)
-	clear_concealment(buf, entry)
+	update_reservation(buf, entry)
 end
 
 --- Drop `entry` completely (block vanished from the buffer).
 local function destroy_entry(buf, entry)
-	reveal_entry(buf, entry)
+	deactivate_entry(buf, entry)
 end
 
 --- Pending reposition sweeps per buffer (at most one per scheduler tick).
@@ -571,71 +440,43 @@ local function deep_redraw(buf)
 	end, 100)
 end
 
---- Show `entry`: conceal the source and make sure the image is rendered.
+--- Show `entry`: make sure every window has the image and the row
+--- reservation is in place. The source is never concealed.
 local function show_entry(buf, entry)
 	if entry.shown then
 		return
 	end
 	entry.shown = true
-	clear_concealment(buf, entry)
-
-	-- content lines; the anchor row keeps its leading indentation columns
-	-- visible so the image's x anchor is not shifted left by conceal width
-	for r = entry.math_row + 1, entry.erow - 1 do
-		if r == entry.anchor_row then
-			hide_line(buf, entry, r, entry.indent)
-		else
-			hide_line(buf, entry, r)
-		end
-	end
-	-- tag rows
-	if module.config.public.conceal_math_tags then
-		hide_row(buf, entry, entry.math_row)
-		hide_row(buf, entry, entry.erow)
-	end
 
 	if entry.png then
 		ensure_entry_images(buf, entry)
-	elseif not entry.pending and entry.has_content then
-		entry.pending = true
-		local snippet = entry.snippet
-		backends.render(snippet, module.private.backend, function(png, err)
-			entry.pending = false
-			if err then
-				module.private.report_error(module.private.backend, err)
-			end
-			if not vim.api.nvim_buf_is_valid(buf) or not module.private.do_render then
-				return
-			end
-			local current = module.private.blocks[buf]
-			local live = current and current[entry.math_row]
-			-- The block may have changed while we were converting.
-			if not live or live ~= entry or live.snippet ~= snippet then
-				return
-			end
-			if not png then
-				-- Nothing to show: un-conceal the source instead of hiding it
-				-- under a nonexistent image.
-				if entry.shown then
-					reveal_entry(buf, entry)
-				end
-				return
-			end
-			-- Don't pop an image under the cursor while the user reads the source.
-			local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-			if not vim.wo.conceallevel or vim.wo.conceallevel < 2 or cursor_inside(entry, row) then
-				return
-			end
-			entry.png = png
-			if not entry.shown then
-				show_entry(buf, entry)
-			else
-				ensure_entry_images(buf, entry)
-			end
-			-- The new image (and its filler) shifts every block below it.
-			schedule_reposition(buf)
-		end)
+		return
 	end
+	if entry.pending or not entry.has_content then
+		return
+	end
+
+	entry.pending = true
+	local snippet = entry.snippet
+	backends.render(snippet, module.private.backend, function(png, err)
+		entry.pending = false
+		if err then
+			module.private.report_error(module.private.backend, err)
+		end
+		if not png or not vim.api.nvim_buf_is_valid(buf) or not module.private.do_render then
+			return
+		end
+		local current = module.private.blocks[buf]
+		local live = current and current[entry.math_row]
+		-- The block may have changed while we were converting.
+		if not live or live ~= entry or live.snippet ~= snippet then
+			return
+		end
+		entry.png = png
+		ensure_entry_images(buf, entry)
+		-- The new image (and its reservation) shifts every block below it.
+		schedule_reposition(buf)
+	end)
 end
 
 ------------------------------------------------------------------------------
@@ -668,15 +509,11 @@ local function full_render(buf)
 				math_row = want.math_row,
 				erow = want.erow,
 				indent = want.indent,
-				anchor_row = want.anchor_row,
 				snippet = want.snippet,
 				has_content = want.has_content,
 				png = nil,
 				images = {},
-				conceal_ids = {},
-				tag_ids = {},
-				surplus_ids = {},
-				filler_id = nil,
+				reservation_id = nil,
 				shown = false,
 				pending = false,
 			}
@@ -684,28 +521,12 @@ local function full_render(buf)
 		else
 			entry.erow = want.erow
 			entry.indent = want.indent
-			entry.anchor_row = want.anchor_row
 			entry.has_content = want.has_content
 		end
 
-		-- Empty blocks have nothing to render; only conceal their tags.
-		if not entry.has_content then
-			if module.config.public.conceal_math_tags and vim.wo.conceallevel >= 2 then
-				clear_concealment(buf, entry)
-				hide_row(buf, entry, entry.math_row)
-				hide_row(buf, entry, entry.erow)
-			else
-				clear_concealment(buf, entry)
-				clear_image(entry)
-				entry.shown = false
-			end
-		else
-			local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-			if cursor_inside(entry, row) or (vim.wo.conceallevel or 0) < 2 then
-				reveal_entry(buf, entry)
-			else
-				show_entry(buf, entry)
-			end
+		-- Empty blocks have nothing to render.
+		if entry.has_content then
+			show_entry(buf, entry)
 		end
 	end
 
@@ -713,37 +534,14 @@ local function full_render(buf)
 	schedule_reposition(buf)
 end
 
---- Light pass on cursor movement: only toggle reveal/conceal for blocks the
---- cursor entered or left. No tree-sitter query, no conversions.
+--- Light pass on cursor movement: re-sync the window set (splits may have
+--- been opened or closed while focus moved). The source is always visible,
+--- so there is no reveal/conceal state to maintain anymore.
 local function update_cursor(buf)
-	local state = module.private.blocks[buf]
-	if not state or not module.private.do_render then
+	if not module.private.do_render then
 		return
 	end
-
-	-- focus may have moved to another window showing this buffer
 	sync_windows(buf)
-
-	local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-	local conceal_ok = (vim.wo.conceallevel or 0) >= 2
-	local changed = false
-
-	for _, entry in pairs(state) do
-		local want_shown = conceal_ok and entry.has_content and not cursor_inside(entry, row)
-		if want_shown ~= entry.shown then
-			if want_shown then
-				show_entry(buf, entry)
-			else
-				reveal_entry(buf, entry)
-			end
-			changed = true
-		end
-	end
-
-	-- A reveal/conceal toggles screen rows; every other image must re-anchor.
-	if changed then
-		schedule_reposition(buf)
-	end
 end
 
 --- Debounced full render for `buf`.
@@ -794,9 +592,6 @@ local function disable_rendering()
 		end
 		for _, entry in pairs(state) do
 			clear_image(entry)
-			entry.conceal_ids = {}
-			entry.tag_ids = {}
-			entry.surplus_ids = {}
 			entry.shown = false
 		end
 	end
@@ -1040,7 +835,7 @@ module.public = {
 		for _, entry in pairs(state) do
 			clear_image(entry)
 			entry.conceal_ids = {}
-			entry.tag_ids = {}
+			entry.surplus_ids = {}
 			entry.shown = false
 		end
 	end,
