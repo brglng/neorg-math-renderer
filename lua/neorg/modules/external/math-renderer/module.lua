@@ -56,8 +56,9 @@ module.config.public = {
 	-- visible; the image occupies reserved virtual lines next to it.
 	position = "below",
 
-	-- Keep the formula image visible when its math block is folded. Set this
-	-- true to hide the image and remove its virtual-line reservation instead.
+	-- Keep the formula image visible when its own math block is folded.
+	-- Set true to hide it and remove its reservation. An image is always
+	-- hidden when an outer section/paragraph fold contains the math block.
 	hide_on_fold = false,
 
 	-- LaTeX-to-PNG backends in preference order. The first backend whose
@@ -265,12 +266,22 @@ local function entry_fold_info(entry, win)
 		if start_row == -1 then
 			return nil
 		end
+		local end_row = vim.fn.foldclosedend(entry.math_row + 1) - 1
+		local start_row_zero = start_row - 1
 		return {
-			start_row = start_row - 1,
-			end_row = vim.fn.foldclosedend(entry.math_row + 1) - 1,
+			start_row = start_row_zero,
+			end_row = end_row,
+			-- An exact fold of the ranged math tag is the block's own fold.
+			-- Anything extending outside its @math..@end rows is an outer
+			-- section/paragraph fold and is hidden even when hide_on_fold=false.
+			outer = start_row_zero < entry.math_row or end_row > entry.erow,
 		}
 	end)
 	return ok and info or nil
+end
+
+local function fold_hides_image(fold)
+	return fold ~= nil and (fold.outer or module.config.public.hide_on_fold)
 end
 
 --- Choose the visible image/window used for the buffer-wide reservation.
@@ -282,7 +293,7 @@ local function reservation_window(buf, entry, preferred_win)
 	local fallback
 	for win in pairs(entry.images) do
 		local folded = entry_fold_info(entry, win)
-		if not (module.config.public.hide_on_fold and folded) then
+		if not fold_hides_image(folded) then
 			fallback = fallback or win
 			if win == current then
 				return win
@@ -396,7 +407,7 @@ local function update_reservation(buf, entry, preferred_win)
 	local rows = 0
 	if chosen_win then
 		for win, img in pairs(entry.images) do
-			if not (module.config.public.hide_on_fold and entry_fold_info(entry, win)) then
+			if not fold_hides_image(entry_fold_info(entry, win)) then
 				rows = math.max(rows, image_rows(img))
 			end
 		end
@@ -475,7 +486,7 @@ end
 --- render only, then restore the user's value.
 local function render_entry_image(buf, entry, win, img)
 	local fold = entry_fold_info(entry, win)
-	if fold and module.config.public.hide_on_fold then
+	if fold_hides_image(fold) then
 		if img.math_renderer_absolute then
 			img.window = img.math_renderer_window
 			img.inline = img.math_renderer_inline

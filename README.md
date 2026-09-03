@@ -92,8 +92,9 @@ All options (defaults shown):
     -- "below" (default) or "above".
     position = "below",
 
-    -- Keep the image when the math block is folded (default). Set true to
-    -- hide the image and remove its virtual-line reservation while folded.
+    -- Keep the image when the math block itself is folded (default). Set
+    -- true to hide it and remove its reservation while folded. An outer
+    -- section/paragraph fold always hides the image.
     hide_on_fold = false,
 
     -- LaTeX-to-PNG backends in preference order. The first backend whose
@@ -231,8 +232,8 @@ wrapped in `\[ ... \]`.
 - CursorMoved, CursorHold, folding and scrolling re-anchor existing images
   without regenerating their PNG files. If the math block itself is folded,
   its image and virtual-line reservation move to the visible boundary outside
-  the fold by default; set `hide_on_fold = true` to hide both until the fold
-  opens.
+  the fold by default; set `hide_on_fold = true` to hide both for the block's
+  own fold. An outer section/paragraph fold always hides the image.
 - If the same buffer is displayed in multiple windows, every window gets
   its own rendered images (new splits pick them up automatically, closed
   windows drop theirs).
