@@ -3,8 +3,8 @@
 ---   PATH="/Library/TeX/texbin:$PATH" nvim --headless -l test/smoke.lua
 ---
 --- On this machine ratex/tex2svg are not installed and latex+dvipng are, so
---- the expected outcome is: ratex=false, tex2svg=false, latex=true and a
---- successful end-to-end conversion through the latex backend.
+--- the expected outcome is: ratex=false, tex2svg=false, latex=true and
+--- successful block and inline conversions through the latex backend.
 
 package.path = "lua/?.lua;" .. package.path
 
@@ -78,6 +78,29 @@ if first_path then
 		return second_path ~= nil
 	end)
 	check("cache hit returns the same file", second_path == first_path)
+end
+
+-- The traditional backend needs inline `$...$` delimiters to enter math mode.
+-- Keep this check conditional because alternate backends may use different
+-- delimiter conventions while still supporting the module's inline path.
+if resolved == "latex" then
+	local inline_path, inline_err
+	backends.render("$a^2 + b^2 = c^2$", resolved, function(path, err)
+		inline_path, inline_err = path, err
+	end, { inline = true })
+	if not vim.wait(60000, function()
+		return inline_path ~= nil or inline_err ~= nil
+	end) then
+		print("FAIL inline render timed out")
+		vim.defer_fn(function()
+			vim.cmd("cquit 1")
+		end, 0)
+		return
+	end
+	check("inline render produced a PNG", inline_path ~= nil)
+	if inline_err then
+		print(("inline backend error: %s"):format(inline_err))
+	end
 end
 
 vim.fn.delete(cache_dir, "rf")

@@ -1,15 +1,18 @@
 # neorg-math-renderer
 
-Render Neorg `@math ... @end` blocks as LaTeX images directly inside Neovim,
-powered by [image.nvim](https://github.com/3rd/image.nvim).
+Render Neorg `@math ... @end` blocks and inline `$...$` math as LaTeX images
+directly inside Neovim, powered by
+[image.nvim](https://github.com/3rd/image.nvim).
 
-Inline `$...$` math is deliberately left untouched — only ranged `@math`
-blocks are rendered.
+**Do not load `core.latex.renderer` together with this module.** Both modules
+render inline math; loading both creates duplicate images and competing
+conceal extmarks.
 
 ## Features
 
-- **Block-only rendering**: `@math ... @end` blocks become images; inline math
-  is never touched.
+- **Block and inline rendering**: `@math ... @end` blocks and inline math
+  become images. Block source is always visible; inline source follows
+  `conceal`.
 - **Pluggable LaTeX backends**, probed in a configurable preference order:
   1. `ratex` — the [RaTeX](https://github.com/erweixin/RaTeX) `ratex-render`
      CLI (pure Rust, KaTeX-compatible, renders PNG directly)
@@ -17,15 +20,22 @@ blocks are rendered.
      `rsvg-convert`/`magick`/`convert`
   3. `latex` — traditional `latex` + `dvipng` (same pipeline as neorg's own
      `core.latex.renderer`)
-- **True-size images, no upscaling**: images render at their natural pixel
-  size; with `fit_window = true` (default) oversized images are scaled down
-  to fit the window, never up.
-- **neorg-nabla compatible options**: `render_on_enter`, `debounce_ms`.
-- **Visible source, image beside it**: the LaTeX source is never hidden;
-  each formula renders on reserved virtual lines directly below (default)
-  or above the block (`position` option).
-- **Disk cache**: one PNG per unique formula (keyed by snippet + backend +
-  foreground color), shared across sessions.
+- **Inline height-aware scaling**: `scale` sets maximum inline-image height
+  in terminal cell rows. Inline images exceeding cap are downscaled
+  proportionally; smaller images are never enlarged. For visible suffix text,
+  complete-line inline layout may require proportional width/height reduction;
+  with no safe width, image is hidden rather than covering suffix text. A
+  line-end formula does not spend its width on raw source bytes: source is
+  concealed without a replacement placeholder, and image width is capped only
+  by terminal edge when needed. Block sizing remains controlled by `fit_window`.
+- **`core.latex.renderer`-compatible options**: `conceal`, `dpi`,
+  `render_on_enter`, `renderer`, `debounce_ms`, and `scale` (except
+  `min_length`, which is intentionally unsupported).
+- **Visible block source, concealed inline source**: block images render on
+  reserved virtual lines directly below (default) or above the block
+  (`position` option). Inline images hide whenever their source row is folded.
+- **Disk cache**: one PNG per unique formula and render mode (keyed by
+  snippet + backend + mode + foreground color), shared across sessions.
 
 ## Requirements
 
@@ -72,8 +82,8 @@ In a norg buffer:
 :Neorg render-math toggle
 ```
 
-Images appear as soon as the backend conversion finishes; the LaTeX source
-itself is never hidden.
+Images appear as soon as backend conversion finishes. Block source stays
+visible; inline source follows `conceal` and remains editable on its cursor row.
 
 ## Configuration
 
@@ -101,12 +111,26 @@ All options (defaults shown):
     -- probe succeeds is used.
     backends = { "ratex", "tex2svg", "latex" },
 
-    -- false: render at native pixel size, never scaled.
-    -- true:  downscale oversized images to fit the window (never upscale).
-    fit_window = true,
+    -- Conceal inline math source when conceallevel permits it. This never
+    -- conceals `@math` block source.
+    conceal = true,
 
     -- dvipng density for the traditional `latex` backend.
     dpi = 350,
+
+    -- Renderer name accepted for core.latex.renderer compatibility. This
+    -- module uses image.nvim directly for block reservations.
+    renderer = "core.integrations.image",
+
+    -- Maximum inline-image height in terminal cell rows. Inline images above
+    -- this limit are downscaled proportionally; smaller images are never
+    -- enlarged. Math block sizing is controlled by fit_window.
+    scale = 1,
+
+    -- false: block images render at native pixel size, never scaled.
+    -- true:  downscale oversized block images to fit the window (never upscale).
+    -- This option does not affect inline images.
+    fit_window = true,
 
     -- Foreground color as "#rrggbb". nil = foreground of
     -- `@neorg.rendered.latex` (following its link, so it tracks your
@@ -139,7 +163,7 @@ Each of `ratex`, `tex2svg` and `latex` accepts either a **string** or a
 
   ```lua
   latex = function(snippet, opts, callback)
-    -- opts = { foreground_color, background_color, cache_dir }
+    -- opts = { foreground_color, background_color, cache_dir, inline }
     -- Render `snippet` however you like (subprocess, HTTP service, ...),
     -- then either return the PNG path synchronously:
     return png_path
@@ -224,16 +248,32 @@ wrapped in `\[ ... \]`.
 
 ## How rendering works
 
-- The LaTeX source of a math block is never hidden: the formula image is
-  an addition rendered on reserved virtual lines directly below (default)
-  or directly above the block.
-- The reservation tracks the image height exactly, so following text is
-  pushed down by the image height and no blank rows are left behind.
+- The source of a `@math` block is never concealed: its image is an addition
+  rendered on reserved virtual lines directly below (default) or directly
+  above the block. `hide_on_fold` controls the block image only; an outer
+  section/paragraph fold always hides it.
+- Inline math uses core renderer normalization for `$...$` and `$|...|$`.
+  With `conceal = true`, source is concealed away from its cursor row and the
+  image is cleared on that row for editing. With `conceal = false`, source
+  remains visible. A non-whitespace suffix (including following inline nodes)
+  uses inline replacement text only when complete raw/display line plus
+  placeholders fits actual window width; one cell of slack avoids edge
+  wrapping. If needed, image width and height are reduced together to
+  preserve aspect ratio. If no positive safe width remains, source stays
+  visible and image is hidden. A line-end formula uses conceal without
+  replacement text and normal height-capped sizing, bounded only by terminal
+  edge when needed. Inline images never use image.nvim virtual-line padding or
+  reserve vertical rows.
+- `scale` is a maximum inline-image height in terminal cell rows. Only inline
+  images taller than that limit are reduced; shorter images keep native size.
+  Width follows original aspect ratio. When line fitting needs more reduction,
+  width and height are reduced together; block images keep their previous
+  native/`fit_window` sizing behavior.
+- Inline images are always hidden while their source row is inside a closed
+  fold. They are not moved outside folds like block images.
 - CursorMoved, CursorHold, folding and scrolling re-anchor existing images
-  without regenerating their PNG files. If the math block itself is folded,
-  its image and virtual-line reservation move to the visible boundary outside
-  the fold by default; set `hide_on_fold = true` to hide both for the block's
-  own fold. An outer section/paragraph fold always hides the image.
+  without regenerating PNG files. Multiple windows receive independent image
+  objects; inline conceal remains buffer-scoped like core's renderer.
 - If the same buffer is displayed in multiple windows, every window gets
   its own rendered images (new splits pick them up automatically, closed
   windows drop theirs).
@@ -251,6 +291,14 @@ A backend smoke test that does not require neorg:
 
 ```bash
 PATH="/Library/TeX/texbin:$PATH" nvim --headless -l test/smoke.lua
+```
+
+A focused inline layout regression test checks safe inline conceal text,
+strict no-padding/no-virtual-line source invariants, and stale-anchor guard
+coverage:
+
+```bash
+nvim --headless -u NONE -l test/inline_layout.lua
 ```
 
 `test/sample.norg` contains math blocks of every supported shape for manual

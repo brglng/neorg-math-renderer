@@ -1,19 +1,27 @@
 --[[
     file: external.math-renderer
-    title: Render `@math` blocks as images with image.nvim
-    summary: Renders Neorg `@math ... @end` blocks as LaTeX images using image.nvim.
+    title: Render Neorg math as images with image.nvim
+    summary: Renders Neorg `@math ... @end` blocks and inline math as images using image.nvim.
     ---
 
-Renders Neorg `@math ... @end` blocks (and *only* those -- inline `$...$`
-math is deliberately left untouched) by converting each block's LaTeX source
-into a PNG image and displaying it in place with
+Renders Neorg `@math ... @end` blocks and inline `$...$` math by converting
+LaTeX source into PNG images and displaying them with
 [image.nvim](https://github.com/3rd/image.nvim).
+
+Do not load `core.latex.renderer` with this module. Both modules render inline
+math and would otherwise create duplicate images and competing conceal marks.
 
 Toggle rendering with `:Neorg render-math enable|disable|toggle`.
 
-The LaTeX source stays visible. The rendered image is placed on reserved
-virtual lines above or below the block; when the block is folded, the image
-and its reservation move to a visible boundary outside the fold.
+Block LaTeX source stays visible. Block images are placed on reserved
+virtual lines above or below the block; when a block is folded, its image and
+reservation move to a visible boundary outside the fold. Inline source is
+concealed according to `conceal`; inline images never reserve virtual lines
+and hide whenever their source row is folded. Inline replacement text is used
+only for formulas with visible suffix/layout nodes, and only when complete
+raw/display line budgeting is safe. End-of-line formulas conceal source
+without replacement text and keep normal height-capped aspect-ratio sizing,
+subject only to a terminal-edge bound when needed.
 
 Image backends are probed in the configured `backends` preference order:
 
@@ -62,20 +70,39 @@ module.config.public = {
 	hide_on_fold = false,
 
 	-- LaTeX-to-PNG backends in preference order. The first backend whose
-	-- executables are found is used for every block.
+	-- executables are found is used for every formula.
 	--   "ratex"   -> `ratex-render` (RaTeX CLI, KaTeX-compatible, pure Rust)
 	--   "tex2svg" -> MathJax `tex2svg` CLI + rsvg-convert/magick/convert
 	--   "latex"   -> traditional `latex` + `dvipng`
 	backends = { "ratex", "tex2svg", "latex" },
 
-	-- When false, images render at their native pixel size and are never
-	-- scaled up or down -- a formula wider than the window simply overflows.
-	-- When true (default), oversized images are scaled down to fit the window
-	-- (never scaled up).
-	fit_window = true,
+	-- Conceal inline math source when conceallevel permits it. This setting
+	-- never conceals `@math` block source; inline images never reserve virtual
+	-- lines, regardless of this setting.
+	conceal = true,
 
 	-- Dots per inch used by dvipng for the traditional `latex` backend.
 	dpi = 350,
+
+	-- Renderer name retained for core.latex.renderer configuration
+	-- compatibility. This module always uses image.nvim directly because block
+	-- reservations need its low-level image object.
+	renderer = "core.integrations.image",
+
+	-- Maximum inline-image height in terminal cell rows, expressed as a
+	-- multiple of one terminal line. Inline images above this limit are
+	-- downscaled proportionally; smaller images are never enlarged. For a
+	-- visible suffix, additional proportional width / height reduction may be
+	-- needed to keep complete-line inline layout from wrapping; with no safe
+	-- width the image is hidden. End-of-line formulas do not use that raw-line
+	-- leftover budget. Math block sizing remains controlled by `fit_window`.
+	scale = 1,
+
+	-- When false, block images render at native pixel size. When true
+	-- (default), oversized block images are scaled down to fit the window;
+	-- block images are never scaled up. This option does not affect inline
+	-- images.
+	fit_window = true,
 
 	-- Foreground color of rendered formulas as "#rrggbb". When nil, the
 	-- foreground of `@neorg.rendered.latex` is used (falling back to 50%
@@ -93,7 +120,7 @@ module.config.public = {
 	--     pipeline, or
 	--   * a function: a full custom invocation taking over that backend:
 	--       fn(snippet, opts, callback)
-	--     where opts = { foreground_color, background_color, cache_dir }.
+	--     where opts = { foreground_color, background_color, cache_dir, inline }.
 	--     The function must eventually call callback(png_path, nil) -- or
 	--     simply return a path string synchronously. The PNG is moved into
 	--     the cache either way.
@@ -117,6 +144,11 @@ module.private = {
 	---               images (winid -> image), reservation_id, shown, pending }
 	blocks = {},
 
+	--- Per-buffer inline state: bufnr -> { [range_key] = entry }.
+	--- Inline extmarks are buffer-scoped; images remain window-scoped so fold
+	--- visibility is evaluated independently for every window.
+	inlines = {},
+
 	--- Per-buffer debounce timer handles.
 	timers = {},
 
@@ -124,7 +156,6 @@ module.private = {
 	last_error_notify = {},
 }
 
---- Compute the foreground color and push the user configuration into the
 --- Recompute the formula foreground from the active colorscheme. Mirrors
 --- core.latex.renderer: read `@neorg.rendered.latex` (the editor resolves
 --- its link for us) and fall back to 50% grey when the group has no
@@ -171,8 +202,8 @@ end
 local ts = nil
 
 --- Collect every `@math ... @end` block in `buf`.
---- Inline math is intentionally not matched: the query only targets ranged
---- verbatim tags named "math".
+--- The query only targets ranged verbatim tags named "math"; inline math is
+--- collected separately so block source can never inherit inline concealment.
 ---@param buf integer
 ---@return table<number, table> entries keyed by block start row (0-based)
 local function get_math_blocks(buf)
@@ -225,6 +256,61 @@ local function get_math_blocks(buf)
 	return entries
 end
 
+--- Match core.latex.renderer's inline source normalization exactly. Norg's
+--- `$|...|$` form uses the bars to mark the editable region; normal inline
+--- math keeps `$` delimiters and unescapes escaped characters.
+---@param original string
+---@return string
+local function clean_inline_snippet(original)
+	local clean = original:gsub("^%$|", "$")
+	clean = clean:gsub("|%$$", "$")
+	if clean == original then
+		clean = clean:gsub("\\(.)", "%1")
+	end
+	return clean
+end
+
+--- Collect every inline math node, including multiple nodes on one line.
+---@param buf integer
+---@return table<string, table> entries keyed by current source range
+local function get_inline_math(buf)
+	local entries = {}
+
+	module.required["core.integrations.treesitter"].execute_query(
+		[[
+			(
+				(inline_math) @inline
+				(#offset! @inline 0 1 0 -1)
+			)
+		]],
+		function(query, id, node)
+			if query.captures[id] ~= "inline" then
+				return
+			end
+
+			local original = ts.get_node_text(node, buf)
+			if type(original) ~= "string" then
+				return
+			end
+			local range = { node:range() }
+			local key = ("%d:%d:%d:%d"):format(range[1], range[2], range[3], range[4])
+			entries[key] = {
+				key = key,
+				range = range,
+				snippet = clean_inline_snippet(original),
+				png = nil,
+				images = {},
+				extmark_id = nil,
+				shown = false,
+				pending = false,
+			}
+		end,
+		buf
+	)
+
+	return entries
+end
+
 local function clear_image(entry)
 	for win, img in pairs(entry.images or {}) do
 		pcall(function()
@@ -234,14 +320,110 @@ local function clear_image(entry)
 	end
 end
 
---- Terminal rows the rendered image occupies: prefer the height reported
---- by the last successful render, fall back to a pixel estimate.
+--- `scale` is the maximum image height in terminal cell rows. A terminal
+--- line is one cell row, so the configured value is also the cell-row cap.
+local function scale_limit()
+	local scale = tonumber(module.config.public.scale)
+	if scale and scale > 0 then
+		return scale
+	end
+	return nil
+end
+
+--- Return native height capped by `scale`, in terminal cell rows. Explicitly
+--- setting native height even below the cap prevents image.nvim's global
+--- `scale_factor` from enlarging short formulas.
+local function image_height_limit(img)
+	local cap = scale_limit()
+	local ok_term, term = pcall(function()
+		return require("image.utils.term").get_size()
+	end)
+	local px = img and tonumber(img.image_height)
+	if not ok_term or not term or not term.cell_height or term.cell_height <= 0 or not px or px <= 0 then
+		return nil
+	end
+	local native_rows = px / term.cell_height
+	return cap and math.min(native_rows, cap) or native_rows
+end
+
+--- Return scaled display dimensions in terminal cells for inline images.
+--- `max_width` is an optional complete-line layout budget. When it is
+--- smaller than the height-capped image, reduce both dimensions by the same
+--- factor; this keeps the image's aspect ratio and never upscales it.
+--- The third return value is exact height in terminal rows for image.nvim's
+--- geometry; the second is its rounded screen-cell height.
+local function image_display_dimensions(img, max_width)
+	if max_width and max_width <= 0 then
+		return 0, 0, 0
+	end
+	local ok_term, term = pcall(function()
+		return require("image.utils.term").get_size()
+	end)
+	local width = img and tonumber(img.image_width)
+	local height = img and tonumber(img.image_height)
+	if
+		not ok_term
+		or not term
+		or not term.cell_width
+		or not term.cell_height
+		or term.cell_width <= 0
+		or term.cell_height <= 0
+		or not width
+		or not height
+		or width <= 0
+		or height <= 0
+	then
+		return 1, 1, 1
+	end
+
+	local factor = 1
+	local cap = scale_limit()
+	local native_rows = height / term.cell_height
+	if cap and native_rows > cap then
+		factor = cap / native_rows
+	end
+	local height_factor = factor
+	local width_factor
+	if max_width then
+		-- Inline virtual text must fit the complete raw/display line. A width
+		-- cap therefore downscales height too instead of clipping or overlaying
+		-- the suffix after the formula.
+		width_factor = max_width * term.cell_width / width
+		factor = math.min(factor, width_factor)
+	end
+
+	local display_width = math.max(1, math.floor(width * factor / term.cell_width))
+	if max_width then
+		display_width = math.min(display_width, max_width)
+	end
+	local exact_height = native_rows * factor
+	if width_factor and width_factor <= height_factor then
+		-- image.nvim rounds one dimension up while restoring aspect ratio. Make
+		-- horizontal fitting infinitesimally narrower so that rounding cannot
+		-- turn a width budget of N cells into N+1 painted cells.
+		exact_height = (display_width * term.cell_width / (width / height)) / term.cell_height * (1 - 1e-9)
+	end
+	return display_width, math.max(1, math.ceil(exact_height)), exact_height
+end
+
+--- Apply current scale to an image. Resetting height on every render also
+--- handles runtime config changes and prevents accidental upscaling.
+local function apply_image_height_limit(img)
+	if img and img.geometry then
+		img.geometry.height = image_height_limit(img)
+	end
+end
+
+--- Terminal rows the rendered block image occupies: prefer the height
+--- reported by the last successful render, fall back to a pixel estimate.
+--- Inline `scale` is intentionally not applied here; block sizing continues
+--- to follow `fit_window` and the image's rendered geometry.
 local function image_rows(img)
 	local ok, rendered = pcall(function()
 		return img.rendered_geometry and img.rendered_geometry.height
 	end)
 	if ok and type(rendered) == "number" and rendered > 0 then
-		return rendered
+		return math.max(1, math.floor(rendered))
 	end
 	local ok_term, term = pcall(function()
 		return require("image.utils.term").get_size()
@@ -249,10 +431,66 @@ local function image_rows(img)
 	local ok_px, px = pcall(function()
 		return img.image_height
 	end)
-	if ok_term and ok_px and term and term.cell_height and px and px > 0 then
+	if ok_term and ok_px and term and term.cell_height and term.cell_height > 0 and px and px > 0 then
 		return math.max(1, math.floor(px / term.cell_height))
 	end
 	return 1
+end
+
+--- Check buffer row/column before passing it to image.nvim. image.nvim calls
+--- `screenpos()` internally and raises E966 when its row is beyond the current
+--- buffer after a deletion or buffer shrink.
+local function buffer_position_valid(buf, row, col)
+	if not vim.api.nvim_buf_is_valid(buf) or type(row) ~= "number" or row < 0 then
+		return false
+	end
+	if row ~= math.floor(row) or row >= vim.api.nvim_buf_line_count(buf) then
+		return false
+	end
+	if col == nil then
+		return true
+	end
+	if type(col) ~= "number" or col < 0 or col ~= math.floor(col) then
+		return false
+	end
+	local ok, lines = pcall(vim.api.nvim_buf_get_lines, buf, row, row + 1, false)
+	return ok and lines and lines[1] ~= nil and col <= #lines[1]
+end
+
+local function buffer_range_valid(buf, range)
+	if type(range) ~= "table" or #range < 4 then
+		return false
+	end
+	if range[3] < range[1] or (range[3] == range[1] and range[4] < range[2]) then
+		return false
+	end
+	return buffer_position_valid(buf, range[1], range[2])
+		and buffer_position_valid(buf, range[3], range[4])
+end
+
+--- Guard image.nvim's own deferred transform callback as well as this
+--- module's render passes. image.nvim calls `image:render()` later without
+--- going through our entry functions, so stale geometry must be rejected at
+--- the image-object boundary too.
+local function guard_image_render(buf, img)
+	if not img or img.math_renderer_render_guarded or type(img.render) ~= "function" then
+		return
+	end
+	local render = img.render
+	img.render = function(self, geometry)
+		if self.buffer == buf and not self.math_renderer_absolute then
+			local row = geometry and geometry.y or self.geometry and self.geometry.y
+			local col = geometry and geometry.x or self.geometry and self.geometry.x
+			if not buffer_position_valid(buf, row, col) then
+				pcall(function()
+					self:clear(true)
+				end)
+				return
+			end
+		end
+		return render(self, geometry)
+	end
+	img.math_renderer_render_guarded = true
 end
 
 --- Return the closed fold containing `entry` in `win`, if any.
@@ -414,6 +652,13 @@ local function update_reservation(buf, entry, preferred_win)
 	end
 
 	local placement = chosen_win and image_placement(buf, entry, chosen_win, rows) or nil
+	-- A stale block may still point past the end of a recently shortened
+	-- buffer. Keep its old reservation from being used while full_render waits
+	-- for tree-sitter to publish the replacement state.
+	if placement and not buffer_position_valid(buf, placement.image_row) then
+		placement = nil
+		rows = 0
+	end
 	local key = placement and ("%s:%s:%d"):format(
 		tostring(placement.reservation_row),
 		tostring(placement.reservation_above),
@@ -485,6 +730,12 @@ end
 --- source text. Temporarily lower that window-local option for the folded
 --- render only, then restore the user's value.
 local function render_entry_image(buf, entry, win, img)
+	if not buffer_position_valid(buf, entry.math_row) then
+		pcall(function()
+			img:clear(true)
+		end)
+		return
+	end
 	local fold = entry_fold_info(entry, win)
 	if fold_hides_image(fold) then
 		if img.math_renderer_absolute then
@@ -508,6 +759,12 @@ local function render_entry_image(buf, entry, win, img)
 		rows = image_rows(img)
 	end
 	local placement = image_placement(buf, entry, win, rows)
+	if not buffer_position_valid(buf, placement.image_row) then
+		pcall(function()
+			img:clear(true)
+		end)
+		return
+	end
 
 	if placement.folded then
 		local position = screen_position(win, placement.image_row, entry.indent)
@@ -579,15 +836,19 @@ local function create_image(buf, entry, win)
 		with_virtual_padding = false,
 		x = entry.indent,
 		y = y,
-		-- Native size by default: image.nvim's global max_*_window_percentage
-		-- defaults (100% width / 50% height) must never shrink block images.
-		-- 100000% effectively disables both caps; `fit_window` restores sane
-		-- 100% caps (downscale only, never upscale).
+		-- Preserve block sizing behavior: `fit_window` controls whether the
+		-- image.nvim window percentage caps apply. Inline `scale` is unrelated.
 		max_width_window_percentage = module.config.public.fit_window and 100 or 100000,
 		max_height_window_percentage = module.config.public.fit_window and 100 or 100000,
 	})
 	if ok and img then
 		entry.images[win] = img
+		guard_image_render(buf, img)
+		-- Cloned image.nvim objects inherit caps from their source object;
+		-- overwrite them so each block keeps its configured fit behavior.
+		local max_percentage = module.config.public.fit_window and 100 or 100000
+		img.max_width_window_percentage = max_percentage
+		img.max_height_window_percentage = max_percentage
 		-- Establish the fold-aware reservation before calculating screenpos.
 		update_reservation(buf, entry, win)
 		render_entry_image(buf, entry, win, img)
@@ -644,6 +905,8 @@ end
 --- Pending reposition sweeps per buffer (at most one per scheduler tick).
 local reposition_pending = {}
 local reposition_preferred = {}
+local clear_stale_entries
+local render_inline_state
 
 --- Re-render every image in `buf` on the next scheduler tick. Fold changes,
 --- virtual-line reservation moves and other viewport layout changes can move
@@ -667,6 +930,7 @@ local function schedule_reposition(buf, preferred_win)
 		if not module.private.do_render or not vim.api.nvim_buf_is_valid(buf) then
 			return
 		end
+		clear_stale_entries(buf)
 		for _, entry in pairs(module.private.blocks[buf] or {}) do
 			-- Fold state can change the reservation anchor, so update it before
 			-- rendering any image against screenpos.
@@ -677,7 +941,525 @@ local function schedule_reposition(buf, preferred_win)
 				render_entry_image(buf, entry, win, img)
 			end
 		end
+		-- Block reservations and folds change screen positions of inline images
+		-- too. Reuse their PNGs and refresh geometry on the same sweep.
+		render_inline_state(buf)
 	end)
+end
+
+--------------------------------------------------------------------------------
+-- inline math apply / conceal
+--------------------------------------------------------------------------------
+
+local function clear_inline_extmark(buf, entry)
+	if entry.extmark_id then
+		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, entry.extmark_id)
+		entry.extmark_id = nil
+	end
+end
+
+local function clear_inline_entry(buf, entry)
+	clear_image(entry)
+	clear_inline_extmark(buf, entry)
+end
+
+--- Return current cursor row and conceallevel for the window that displays
+--- `buf`. Conceal is buffer-scoped, so use the current window when possible,
+--- matching core.latex.renderer's single-window behavior.
+local function inline_context(buf)
+	local current = vim.api.nvim_get_current_win()
+	local win
+	if vim.api.nvim_win_is_valid(current) then
+		local ok, current_buf = pcall(vim.api.nvim_win_get_buf, current)
+		if ok and current_buf == buf then
+			win = current
+		end
+	end
+	if not win then
+		local wins = vim.fn.win_findbuf(buf)
+		win = wins[1]
+	end
+	if not win or not vim.api.nvim_win_is_valid(win) then
+		return nil, nil, nil
+	end
+	local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+	local ok, conceallevel = pcall(vim.api.nvim_get_option_value, "conceallevel", { win = win })
+	if not ok then
+		conceallevel = 0
+	end
+	return row, conceallevel, win
+end
+
+--- Display width of source text in one inline node. This is used as a safe
+--- image width cap when conceal is disabled: an image wider than its source
+--- would otherwise paint over following buffer text.
+local function inline_source_width(buf, range)
+	if range[1] ~= range[3] then
+		return 0
+	end
+	local line = vim.api.nvim_buf_get_lines(buf, range[1], range[1] + 1, false)[1] or ""
+	return vim.fn.strdisplaywidth(line:sub(range[2] + 1, range[4]))
+end
+
+--- Display width of non-whitespace text after an inline range. A following
+--- inline node is also returned as layout suffix: its source is concealed,
+--- but its image still needs a placeholder before later text can be safe.
+--- Ignoring trailing whitespace is key for a formula at line end; raw source
+--- bytes after that formula must not force its image to near-zero width.
+local function inline_suffix_width(buf, entry)
+	local range = entry.range
+	if range[1] ~= range[3] then
+		return math.huge, 0
+	end
+	local line = vim.api.nvim_buf_get_lines(buf, range[1], range[1] + 1, false)[1] or ""
+	local following = {}
+	for _, other in pairs(module.private.inlines[buf] or {}) do
+		if
+			other ~= entry
+			and other.range[1] == range[1]
+			and other.range[3] == range[3]
+			and other.range[2] >= range[4]
+		then
+			table.insert(following, other)
+		end
+	end
+	table.sort(following, function(a, b)
+		return a.range[2] < b.range[2]
+	end)
+
+	local suffix_width = 0
+	local cursor = range[4]
+	local following_nodes = 0
+	local function add_non_whitespace(text)
+		local trimmed = text:gsub("^%s+", ""):gsub("%s+$", "")
+		if trimmed ~= "" then
+			suffix_width = suffix_width + vim.fn.strdisplaywidth(trimmed)
+		end
+	end
+	for _, other in ipairs(following) do
+		add_non_whitespace(line:sub(cursor + 1, other.range[2]))
+		cursor = math.max(cursor, other.range[4])
+		following_nodes = following_nodes + 1
+	end
+	add_non_whitespace(line:sub(cursor + 1))
+	return suffix_width, following_nodes
+end
+
+--- Display width of complete raw source line. Neovim's wrapping calculation
+--- can still account for concealed bytes when inline virtual text is present,
+--- even though those bytes are not painted. Using the complete raw/display
+--- width is conservative and keeps replacement text from creating a wrapped
+--- screen row. This budget is used only when visible suffix/layout nodes
+--- follow the formula. `strdisplaywidth` preserves tabs and wide CJK cells.
+local function inline_raw_line_width(buf, range)
+	if range[1] ~= range[3] then
+		return math.huge
+	end
+	local line = vim.api.nvim_buf_get_lines(buf, range[1], range[1] + 1, false)[1] or ""
+	return vim.fn.strdisplaywidth(line)
+end
+
+--- Text width available for normal wrapping in one window. `getwininfo().textoff`
+--- covers number/sign/fold columns; subtracting it from the actual window width
+--- avoids treating decorations as space available for the inline line.
+local function inline_text_width(win)
+	if not vim.api.nvim_win_is_valid(win) then
+		return 0
+	end
+	local ok_width, win_width = pcall(vim.api.nvim_win_get_width, win)
+	if not ok_width or type(win_width) ~= "number" then
+		return 0
+	end
+	local info = vim.fn.getwininfo(win)[1]
+	local textoff = info and tonumber(info.textoff) or 0
+	return math.max(0, math.floor(win_width - textoff))
+end
+
+--- Width available from an inline range to the terminal edge. Unlike the
+--- complete-line budget, this accounts only for the visible prefix before the
+--- formula. It keeps line-end images inside a sensible edge when possible,
+--- without shrinking them because concealed source text made the raw line long.
+local function inline_edge_width(buf, entry)
+	local range = entry.range
+	if range[1] ~= range[3] then
+		return 0
+	end
+	local line = vim.api.nvim_buf_get_lines(buf, range[1], range[1] + 1, false)[1] or ""
+	local prefix_width = vim.fn.strdisplaywidth(line:sub(1, range[2]))
+	local limit = math.huge
+	for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+		local available = inline_text_width(win) - prefix_width - 1
+		-- A prefix which already wraps puts formula at start of continuation
+		-- row; use almost full row rather than a misleading one-cell budget.
+		if available <= 0 then
+			available = math.max(1, inline_text_width(win) - 1)
+		end
+		limit = math.min(limit, available)
+	end
+	if limit == math.huge then
+		return 0
+	end
+	return math.max(1, math.floor(limit))
+end
+
+--- Widths of other inline placeholders on same raw line. Buffer-scoped
+--- conceal extmarks and window-scoped images mean every window must reserve
+--- all placeholders when deciding whether this one may use inline text.
+local function inline_other_placeholder_width(buf, entry)
+	local total = 0
+	for _, other in pairs(module.private.inlines[buf] or {}) do
+		if other ~= entry and other.png and other.range[1] == entry.range[1] and other.range[3] == entry.range[3] then
+			local image
+			for _, candidate in pairs(other.images or {}) do
+				image = candidate
+				break
+			end
+			if image then
+				total = total + image_display_dimensions(image)
+			end
+		end
+	end
+	return total
+end
+
+--- Maximum safe inline placeholder width for a formula with visible text or
+--- following inline nodes. Compare actual window text width against complete
+--- raw/display line plus all placeholders. Leave one cell slack: exact-width
+--- inline text can still wrap at terminal edge. Returning zero keeps source
+--- visible and hides image instead of covering suffix text. Line-end formulas
+--- use inline_edge_width instead and never enter this full-line budget.
+local function inline_max_width(buf, entry)
+	local suffix_width, following_nodes = inline_suffix_width(buf, entry)
+	if suffix_width <= 0 and following_nodes == 0 then
+		return nil
+	end
+	local raw_width = inline_raw_line_width(buf, entry.range)
+	if raw_width == math.huge then
+		return 0
+	end
+	local other_width = inline_other_placeholder_width(buf, entry)
+	local limit = math.huge
+	for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+		limit = math.min(limit, inline_text_width(win) - raw_width - other_width - 1)
+	end
+	if limit == math.huge then
+		return 0
+	end
+	return math.max(0, math.floor(limit))
+end
+
+--- Update one buffer-scoped conceal extmark. Inline extmarks deliberately
+--- cover source delimiters; block entries never call this function. A formula
+--- with visible suffix/layout nodes gets inline replacement text only when
+--- complete-line budgeting leaves safe room. A line-end formula gets conceal
+--- without replacement text, so its image does not inherit raw-line width.
+local function update_inline_extmark(buf, entry, image)
+	local range = entry.range
+	local suffix_width, following_nodes = inline_suffix_width(buf, entry)
+	local suffix_present = suffix_width > 0 or following_nodes > 0
+	local cursor_row, conceallevel = inline_context(buf)
+	local on_cursor_row = cursor_row ~= nil and cursor_row == range[1]
+	local conceal_enabled = type(conceallevel) == "number" and conceallevel >= 2
+	if not module.config.public.conceal or not conceal_enabled then
+		clear_inline_extmark(buf, entry)
+		return on_cursor_row, conceal_enabled, nil, suffix_present
+	end
+
+	-- Full-line budgeting is needed only to shift visible text after this
+	-- formula. End-of-line math uses edge width for image geometry instead.
+	local max_width = suffix_present and inline_max_width(buf, entry) or inline_edge_width(buf, entry)
+	if suffix_present and not on_cursor_row and max_width <= 0 then
+		clear_inline_extmark(buf, entry)
+		return on_cursor_row, conceal_enabled, max_width, suffix_present
+	end
+
+	local ext_opts = {
+		end_row = range[3],
+		end_col = range[4],
+		strict = false,
+		invalidate = true,
+		undo_restore = false,
+		id = entry.extmark_id,
+	}
+
+	if not on_cursor_row then
+		if suffix_present then
+			local width = image_display_dimensions(image, max_width)
+			if width <= 0 then
+				clear_inline_extmark(buf, entry)
+				return on_cursor_row, conceal_enabled, 0, suffix_present
+			end
+			ext_opts.virt_text = { { string.rep(" ", width), "" } }
+			ext_opts.virt_text_pos = "inline"
+		end
+		-- End-of-line conceal intentionally has no replacement text. This keeps
+		-- concealed source from adding a wrapping placeholder of its own.
+		ext_opts.conceal = ""
+	else
+		-- Explicitly clear replacement text left by the previous non-cursor
+		-- pass. This matches core.latex renderer's cursor reveal behavior.
+		ext_opts.virt_text = { { "", "" } }
+	end
+
+	local ok, id = pcall(vim.api.nvim_buf_set_extmark, buf, module.private.ns, range[1], range[2], ext_opts)
+	if ok then
+		entry.extmark_id = id
+	end
+	return on_cursor_row, conceal_enabled, max_width, suffix_present
+end
+
+--- Inline source is hidden by any closed fold in each window. Unlike block
+--- images, inline images are never relocated to a fold boundary.
+local function inline_is_folded(entry, win)
+	if not vim.api.nvim_win_is_valid(win) then
+		return true
+	end
+	local ok, folded = pcall(vim.api.nvim_win_call, win, function()
+		return vim.fn.foldclosed(entry.range[1] + 1) ~= -1
+	end)
+	return ok and folded or false
+end
+
+local function render_inline_entry(buf, entry)
+	if not entry.png then
+		return
+	end
+	if not buffer_range_valid(buf, entry.range) then
+		clear_inline_entry(buf, entry)
+		return
+	end
+
+	local first_image
+	for _, image in pairs(entry.images) do
+		first_image = image
+		break
+	end
+	if not first_image then
+		clear_inline_extmark(buf, entry)
+		return
+	end
+	local on_cursor_row, conceal_enabled, concealed_width, suffix_present = update_inline_extmark(buf, entry, first_image)
+	local width_limit = concealed_width
+	if not conceal_enabled then
+		-- Without active conceal the source remains in normal layout. Keep the
+		-- image within its source span when visible suffix follows it; a
+		-- line-end image only needs the terminal-edge bound.
+		width_limit = suffix_present and inline_source_width(buf, entry.range) or inline_edge_width(buf, entry)
+	end
+
+	for win, image in pairs(entry.images) do
+		local no_conceal_room = conceal_enabled
+			and module.config.public.conceal
+			and suffix_present
+			and not on_cursor_row
+			and type(concealed_width) == "number"
+			and concealed_width <= 0
+		local hidden = inline_is_folded(entry, win)
+			or (module.config.public.conceal and on_cursor_row and conceal_enabled)
+			or no_conceal_room
+		if not hidden then
+			local width = image_display_dimensions(image, width_limit)
+			if width <= 0 then
+				hidden = true
+			end
+		end
+		if hidden then
+			if not image.hidden_by_inline then
+				pcall(function()
+					image:clear()
+				end)
+			end
+			image.hidden_by_inline = true
+		else
+			image.hidden_by_inline = false
+			local width, _, exact_height = image_display_dimensions(image, width_limit)
+			image.geometry.width = width
+			-- Keep horizontal fitting proportional: lowering width also lowers
+			-- geometry height, while the `scale` cap remains a maximum only.
+			image.geometry.height = exact_height
+			image.buffer = buf
+			image.window = win
+			image.inline = true
+			image.render_offset_top = -1
+			pcall(function()
+				image:render({ x = entry.range[2], y = entry.range[1] })
+			end)
+		end
+	end
+end
+
+local function create_inline_image(buf, entry, win)
+	if not module.private.image or not entry.png or entry.images[win] then
+		return
+	end
+
+	local range = entry.range
+	local ok, image = pcall(module.private.image.from_file, entry.png, {
+		window = win,
+		buffer = buf,
+		inline = true,
+		-- Inline math never uses image.nvim virtual padding. Inline images do
+		-- not reserve vertical space regardless of conceal configuration; their
+		-- horizontal geometry is fitted below before rendering.
+		with_virtual_padding = false,
+		x = range[2],
+		y = range[1],
+		render_offset_top = -1,
+		-- Disable image.nvim's global window caps. This module's scale limit is
+		-- height-only and is applied after image dimensions are known.
+		max_width_window_percentage = 100000,
+		max_height_window_percentage = 100000,
+	})
+	if ok and image then
+		entry.images[win] = image
+		guard_image_render(buf, image)
+		-- Cloned image.nvim objects may inherit caps from another image.
+		image.max_width_window_percentage = 100000
+		image.max_height_window_percentage = 100000
+		apply_image_height_limit(image)
+	end
+end
+
+local function ensure_inline_images(buf, entry)
+	local wins = vim.fn.win_findbuf(buf)
+	local live = {}
+	for _, win in ipairs(wins) do
+		live[win] = true
+	end
+	-- Keep this check for image objects created before this invariant was
+	-- introduced. Recreate them without virtual padding.
+	local wanted_padding = false
+	for win, image in pairs(entry.images) do
+		if not live[win] or image.with_virtual_padding ~= wanted_padding then
+			pcall(function()
+				image:clear()
+			end)
+			entry.images[win] = nil
+		end
+	end
+	if entry.shown and entry.png then
+		for _, win in ipairs(wins) do
+			create_inline_image(buf, entry, win)
+		end
+	end
+end
+
+local function sync_inline_windows(buf)
+	for _, entry in pairs(module.private.inlines[buf] or {}) do
+		ensure_inline_images(buf, entry)
+	end
+end
+
+render_inline_state = function(buf)
+	local state = module.private.inlines[buf] or {}
+	-- Create every window-scoped image before laying out any extmark. This
+	-- lets each entry account for other placeholders on its raw line, even
+	-- when several formulas share one line.
+	for _, entry in pairs(state) do
+		if entry.shown and entry.png then
+			ensure_inline_images(buf, entry)
+		end
+	end
+	for _, entry in pairs(state) do
+		if entry.shown and entry.png then
+			render_inline_entry(buf, entry)
+		end
+	end
+end
+
+--- Cancel image.nvim work whose buffer anchor became stale before the
+--- debounced tree-sitter pass catches up. Clearing an image also cancels its
+--- pending transform callback, preventing that callback from calling
+--- `screenpos()` with the deleted row.
+clear_stale_entries = function(buf)
+	if not vim.api.nvim_buf_is_valid(buf) then
+		return
+	end
+
+	for _, entry in pairs(module.private.blocks[buf] or {}) do
+		if not buffer_position_valid(buf, entry.math_row) then
+			clear_image(entry)
+			update_reservation(buf, entry)
+		else
+			for win, image in pairs(entry.images) do
+				local row = image.geometry and image.geometry.y
+				if not image.math_renderer_absolute and type(row) == "number" and not buffer_position_valid(buf, row) then
+					pcall(function()
+						image:clear(true)
+					end)
+					entry.images[win] = nil
+				end
+			end
+			update_reservation(buf, entry)
+		end
+	end
+
+	for _, entry in pairs(module.private.inlines[buf] or {}) do
+		if not buffer_range_valid(buf, entry.range) then
+			clear_inline_entry(buf, entry)
+		else
+			for win, image in pairs(entry.images) do
+				local row = image.geometry and image.geometry.y
+				if type(row) == "number" and not buffer_position_valid(buf, row) then
+					pcall(function()
+						image:clear(true)
+					end)
+					entry.images[win] = nil
+				end
+			end
+		end
+	end
+end
+
+local function deactivate_inline_entry(buf, entry)
+	entry.shown = false
+	clear_inline_entry(buf, entry)
+end
+
+local function destroy_inline_entry(buf, entry)
+	deactivate_inline_entry(buf, entry)
+end
+
+local function show_inline_entry(buf, entry)
+	if entry.shown then
+		ensure_inline_images(buf, entry)
+		render_inline_entry(buf, entry)
+		return
+	end
+	entry.shown = true
+
+	if entry.png then
+		ensure_inline_images(buf, entry)
+		render_inline_entry(buf, entry)
+		return
+	end
+	if entry.pending or not module.private.backend then
+		return
+	end
+
+	entry.pending = true
+	local snippet = entry.snippet
+	backends.render(snippet, module.private.backend, function(png, err)
+		entry.pending = false
+		if err then
+			module.private.report_error(module.private.backend, err)
+		end
+		if not png or not vim.api.nvim_buf_is_valid(buf) or not module.private.do_render then
+			return
+		end
+		clear_stale_entries(buf)
+		local current = module.private.inlines[buf]
+		local live = current and current[entry.key]
+		if not live or live ~= entry or live.snippet ~= snippet then
+			return
+		end
+		entry.png = png
+		-- Lay out all ready inline entries together so multiple formulas on one
+		-- raw line share the same complete-line width budget.
+		render_inline_state(buf)
+		-- Inline images have no virtual padding or row reservation, so they do
+		-- not affect block placement.
+	end, { inline = true })
 end
 
 --- Full refresh of `buf`: recreate every shown image from its cached PNG.
@@ -694,10 +1476,23 @@ local function deep_redraw(buf)
 			deep_redraw(buf)
 			return
 		end
+		clear_stale_entries(buf)
 		for _, entry in pairs(module.private.blocks[buf] or {}) do
 			if entry.shown and entry.png then
 				clear_image(entry)
 				ensure_entry_images(buf, entry)
+			end
+		end
+		local inline_state = module.private.inlines[buf] or {}
+		for _, entry in pairs(inline_state) do
+			if entry.shown and entry.png then
+				clear_image(entry)
+				ensure_inline_images(buf, entry)
+			end
+		end
+		for _, entry in pairs(inline_state) do
+			if entry.shown and entry.png then
+				render_inline_entry(buf, entry)
 			end
 		end
 	end, 100)
@@ -729,6 +1524,7 @@ local function show_entry(buf, entry)
 		if not png or not vim.api.nvim_buf_is_valid(buf) or not module.private.do_render then
 			return
 		end
+		clear_stale_entries(buf)
 		local current = module.private.blocks[buf]
 		local live = current and current[entry.math_row]
 		-- The block may have changed while we were converting.
@@ -746,13 +1542,15 @@ end
 -- rendering passes
 --------------------------------------------------------------------------------
 
---- Full render of the current buffer: re-discover blocks, reconcile state,
---- and apply images/reservations to every block.
+--- Full render of the current buffer: re-discover blocks and inline nodes,
+--- reconcile state, and apply images/reservations without regenerating
+--- cached PNGs.
 local function full_render(buf)
 	if not module.private.do_render or not vim.api.nvim_buf_is_valid(buf) then
 		return
 	end
 
+	clear_stale_entries(buf)
 	local desired = get_math_blocks(buf)
 	local state = module.private.blocks[buf] or {}
 
@@ -764,6 +1562,9 @@ local function full_render(buf)
 			state[row] = nil
 		end
 	end
+	-- Publish state before starting conversions. Custom backend functions may
+	-- return synchronously, and their callbacks must see the live entry.
+	module.private.blocks[buf] = state
 
 	for row, want in pairs(desired) do
 		local entry = state[row]
@@ -793,21 +1594,45 @@ local function full_render(buf)
 		end
 	end
 
-	module.private.blocks[buf] = state
+	local desired_inline = get_inline_math(buf)
+	local inline_state = module.private.inlines[buf] or {}
+	for key, entry in pairs(inline_state) do
+		local want = desired_inline[key]
+		if not want or want.snippet ~= entry.snippet then
+			destroy_inline_entry(buf, entry)
+			inline_state[key] = nil
+		end
+	end
+	for key, want in pairs(desired_inline) do
+		local entry = inline_state[key]
+		if not entry then
+			entry = want
+			inline_state[key] = entry
+		else
+			entry.range = want.range
+		end
+	end
+	-- Publish state before starting async conversions, so callbacks reject
+	-- results from nodes replaced while a backend was still running.
+	module.private.inlines[buf] = inline_state
+	for _, entry in pairs(inline_state) do
+		show_inline_entry(buf, entry)
+	end
+	render_inline_state(buf)
 	schedule_reposition(buf)
 end
 
---- Light pass on cursor movement: re-sync the window set (splits may have
---- been opened or closed while focus moved). The source is always visible,
---- so there is no reveal/conceal state to maintain anymore.
+--- Light pass on cursor movement: re-sync window sets and refresh inline
+--- conceal/image visibility. Existing PNGs and image objects are reused;
+--- backend conversion is never called from this path.
 local function update_cursor(buf)
 	if not module.private.do_render then
 		return
 	end
-	-- Cursor events only need a reposition/window sync. Existing PNGs and
-	-- image objects are reused; full_render/backend conversion is never
-	-- called from this path.
+	clear_stale_entries(buf)
 	sync_windows(buf)
+	sync_inline_windows(buf)
+	render_inline_state(buf)
 	schedule_reposition(buf)
 end
 
@@ -817,6 +1642,7 @@ local function schedule_render(buf, delay)
 		return
 	end
 
+	clear_stale_entries(buf)
 	local existing = module.private.timers[buf]
 	if existing then
 		existing:stop()
@@ -862,7 +1688,17 @@ local function disable_rendering()
 			entry.shown = false
 		end
 	end
+	for buf, state in pairs(module.private.inlines) do
+		if vim.api.nvim_buf_is_valid(buf) then
+			vim.api.nvim_buf_clear_namespace(buf, module.private.ns, 0, -1)
+		end
+		for _, entry in pairs(state) do
+			clear_inline_entry(buf, entry)
+			entry.shown = false
+		end
+	end
 	module.private.blocks = {}
+	module.private.inlines = {}
 end
 
 local function toggle_rendering()
@@ -877,6 +1713,7 @@ local function show_hidden(buf)
 	if not module.private.do_render then
 		return
 	end
+	clear_stale_entries(buf)
 	-- image objects are window-bound; re-render every image of every entry
 	-- with fresh geometry when a window re-enters the buffer.
 	for _, entry in pairs(module.private.blocks[buf] or {}) do
@@ -887,6 +1724,8 @@ local function show_hidden(buf)
 			end
 		end
 	end
+	sync_inline_windows(buf)
+	render_inline_state(buf)
 end
 
 local function colorscheme_changed()
@@ -899,6 +1738,15 @@ local function colorscheme_changed()
 			if vim.api.nvim_buf_is_valid(buf) then
 				for _, entry in pairs(state) do
 					deactivate_entry(buf, entry)
+					entry.png = nil
+				end
+				schedule_render(buf, 0)
+			end
+		end
+		for buf, state in pairs(module.private.inlines) do
+			if vim.api.nvim_buf_is_valid(buf) then
+				for _, entry in pairs(state) do
+					deactivate_inline_entry(buf, entry)
 					entry.png = nil
 				end
 				schedule_render(buf, 0)
@@ -926,17 +1774,21 @@ local event_handlers = {
 	end,
 	["core.autocommands.events.bufwinenter"] = function(event)
 		sync_windows(event.buffer)
+		sync_inline_windows(event.buffer)
 		-- First entry into a buffer we have not rendered yet (e.g. BufReadPost
 		-- fired before the module loaded or before ft was set to norg): render
 		-- it now. full_render records state even for block-less buffers, so
 		-- this stays a one-shot per buffer.
-		if module.private.do_render and module.private.blocks[event.buffer] == nil then
+		if module.private.do_render
+			and (module.private.blocks[event.buffer] == nil or module.private.inlines[event.buffer] == nil)
+		then
 			full_render(event.buffer)
 		end
 		show_hidden(event.buffer)
 	end,
 	["core.autocommands.events.winenter"] = function(event)
 		sync_windows(event.buffer)
+		sync_inline_windows(event.buffer)
 		show_hidden(event.buffer)
 	end,
 	["core.autocommands.events.cursormoved"] = function(event)
@@ -947,6 +1799,12 @@ local event_handlers = {
 	end,
 	["core.autocommands.events.textchanged"] = function(event)
 		schedule_render(event.buffer)
+	end,
+	["core.autocommands.events.textchangedi"] = function(event)
+		-- TextChangedI can fire while an image.nvim transform is still
+		-- pending. Clear deleted anchors immediately; full parsing waits for
+		-- InsertLeave as usual.
+		clear_stale_entries(event.buffer)
 	end,
 	["core.autocommands.events.insertleave"] = function(event)
 		schedule_render(event.buffer)
@@ -976,6 +1834,7 @@ module.events.subscribed = {
 		cursormoved = true,
 		cursorhold = true,
 		textchanged = true,
+		textchangedi = true,
 		insertleave = true,
 		colorscheme = true,
 	},
@@ -998,12 +1857,20 @@ module.load = function()
 	if not ok then
 		vim.notify(
 			"neorg-math-renderer: image.nvim is not installed or could not be loaded; "
-				.. "math block rendering is disabled",
+				.. "math rendering is disabled",
 			vim.log.levels.ERROR
 		)
 		module.private.image = nil
 	else
 		module.private.image = image
+	end
+
+	if module.config.public.renderer ~= "core.integrations.image" then
+		vim.notify(
+			"neorg-math-renderer: renderer option is compatibility-only; "
+			.. "image.nvim is used directly for math images",
+			vim.log.levels.WARN
+		)
 	end
 
 	module.private.ns = vim.api.nvim_create_namespace("neorg-math-renderer")
@@ -1025,7 +1892,16 @@ module.load = function()
 	end
 
 	-- Enable the autocmds this module reacts to.
-	for _, name in ipairs({ "BufReadPost", "BufWinEnter", "WinEnter", "CursorMoved", "CursorHold", "TextChanged", "InsertLeave" }) do
+	for _, name in ipairs({
+		"BufReadPost",
+		"BufWinEnter",
+		"WinEnter",
+		"CursorMoved",
+		"CursorHold",
+		"TextChanged",
+		"TextChangedI",
+		"InsertLeave",
+	}) do
 		module.required["core.autocommands"].enable_autocommand(name)
 	end
 	-- ColorScheme is NOT a buffer event: its match field is the colorscheme
@@ -1054,6 +1930,8 @@ module.load = function()
 			vim.schedule(function()
 				if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
 					sync_windows(buf)
+					sync_inline_windows(buf)
+					render_inline_state(buf)
 					schedule_reposition(buf, win)
 				end
 			end)
@@ -1074,6 +1952,8 @@ module.load = function()
 				vim.schedule(function()
 					if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
 						sync_windows(buf)
+						sync_inline_windows(buf)
+						render_inline_state(buf)
 					end
 				end)
 			end
@@ -1159,11 +2039,16 @@ module.public = {
 	clear = function(buf)
 		buf = buf or vim.api.nvim_get_current_buf()
 		local state = module.private.blocks[buf] or {}
+		local inline_state = module.private.inlines[buf] or {}
 		if vim.api.nvim_buf_is_valid(buf) then
 			vim.api.nvim_buf_clear_namespace(buf, module.private.ns, 0, -1)
 		end
 		for _, entry in pairs(state) do
 			clear_image(entry)
+			entry.shown = false
+		end
+		for _, entry in pairs(inline_state) do
+			clear_inline_entry(buf, entry)
 			entry.shown = false
 		end
 	end,

@@ -1,6 +1,6 @@
 @document.meta
 title: neorg-math-renderer manual test
-description: Math blocks of every supported shape. Run :Neorg render-math enable
+description: Math blocks and inline math. Run :Neorg render-math enable
 authors:
 - neorg-math-renderer
 @end
@@ -19,7 +19,13 @@ An integral identity:
 \int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}
 @end
 
-Inline math like $a^2 + b^2 = c^2$ must NOT be rendered -- only @math blocks.
+Inline math like $a^2 + b^2 = c^2$ and marked math like $|\int_0^1 x\,dx|$
+are rendered too. Multiple inline nodes such as $a$ and $b$ on one row are
+supported. With `conceal = true`, source is shown on its cursor row; closed
+folds hide inline images while block images follow `hide_on_fold`.
+A long inline formula must not create a blank screen row or reserve a
+virtual line below it:
+    - $|\text{bit} = \text{LFSR} \;\&\; 1, \quad \text{feedback} = \text{popcount}(\text{LFSR} \;\&\; \text{poly}) \bmod 2|$
 
 * Alignment content (bare & and \\)
 
@@ -82,8 +88,10 @@ rows left behind regardless of the source line count.
 
 * Checklist
 
-1. The LaTeX source always stays visible; the image renders below the block
-   (or above with `position = "above"`), never covering the code.
+1. Block source always stays visible; its image renders below the block
+   (or above with `position = "above"`). Inline source follows `conceal`.
 2. `:Neorg render-math disable` / `toggle` clears and restores everything.
 3. Change your colorscheme: formulas should re-render with the new
    foreground color (from `@norg.rendered.latex` or `foreground_color`).
+4. Do not load `core.latex.renderer` at the same time; both modules render
+   inline math.

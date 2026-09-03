@@ -7,7 +7,8 @@
 --- Supported backends, in the preference order configured by the user:
 ---   ratex   -- erweixin/RaTeX `ratex-render` CLI (Rust, KaTeX-compatible).
 ---              Reads one formula per line from --input and writes
----              OUTDIR/0001.png (4-digit, 1-based). Display style by default.
+---              OUTDIR/0001.png (4-digit, 1-based). Display style by default;
+---              inline requests use RaTeX's --inline mode.
 ---   tex2svg -- MathJax `tex2svg` CLI (e.g. mathjax-node-cli): formula passed
 ---              as an argument, SVG written to stdout. The SVG is then
 ---              rasterized with rsvg-convert, magick or convert.
@@ -209,14 +210,24 @@ local function backend_cmd(backend)
 	return type(v) == "string" and v or DEFAULT_CMDS[backend]
 end
 
-local function render_ratex(snippet, key, done)
+local function strip_inline_delimiters(snippet)
+	if snippet:sub(1, 1) == "$" and snippet:sub(-1) == "$" then
+		return snippet:sub(2, -2)
+	end
+	return snippet
+end
+
+local function render_ratex(snippet, key, done, render_opts)
 	-- ratex-render reads one formula per line; flatten the block source.
 	local line = (snippet:gsub("%s*\n%s*", " "))
+	if render_opts and render_opts.inline == true then
+		line = strip_inline_delimiters(line)
+	end
 	local dir = job_dir(key .. "-ratex")
 	local input = dir .. "/input.txt"
 	vim.fn.writefile({ line }, input)
 
-	run({
+	local cmd = {
 		backend_cmd("ratex"),
 		"--input",
 		input,
@@ -226,7 +237,12 @@ local function render_ratex(snippet, key, done)
 		M.foreground_hex(),
 		"--background-color",
 		M.background(),
-	}, nil, function(code, _, stderr)
+	}
+	if render_opts and render_opts.inline == true then
+		table.insert(cmd, "--inline")
+	end
+
+	run(cmd, nil, function(code, _, stderr)
 		if code ~= 0 then
 			done(nil, ("ratex-render exited with %d: %s"):format(code, vim.trim(stderr or "")))
 			return
@@ -278,7 +294,7 @@ end
 ---@param snippet string
 ---@param key string unique cache key for this snippet (temp dir name)
 ---@param done fun(path: string|nil, err: string|nil)
-local function render_tex2svg(snippet, key, done)
+local function render_tex2svg(snippet, key, done, render_opts)
 	local rasterize = svg_rasterizer()
 	if not rasterize then
 		done(nil, "no SVG rasterizer found (need rsvg-convert, magick or convert)")
@@ -286,7 +302,8 @@ local function render_tex2svg(snippet, key, done)
 	end
 
 	local cmd = { backend_cmd("tex2svg") }
-	table.insert(cmd, snippet)
+	local input = render_opts and render_opts.inline == true and strip_inline_delimiters(snippet) or snippet
+	table.insert(cmd, input)
 
 	run(cmd, nil, function(code, stdout, stderr)
 		local svg = vim.trim(stdout or "")
@@ -353,8 +370,15 @@ local function latex_lines(snippet)
 	return vim.split(snippet, "\n", { plain = true })
 end
 
-local function latex_body(snippet)
+---@param inline boolean|nil whether snippet already carries inline math delimiters
+local function latex_body(snippet, inline)
 	local lines = latex_lines(snippet)
+	if inline then
+		-- Inline snippets are normalized like core.latex.renderer and already
+		-- contain their surrounding `$` delimiters. Wrapping them in `\\[` and
+		-- `\\]` would nest math mode and make LaTeX reject the document.
+		return lines
+	end
 	local env = snippet:match("\\begin{([%a%*]+)}")
 	-- Top-level environments go straight into the document body.
 	if env and TOPLEVEL_ENVS[env] then
@@ -379,7 +403,8 @@ end
 ---@param snippet string
 ---@param key string unique cache key for this snippet (temp dir name)
 ---@param done fun(path: string|nil, err: string|nil)
-local function render_latex(snippet, key, done)
+---@param render_opts table|nil conversion mode options
+local function render_latex(snippet, key, done, render_opts)
 	local dir = job_dir(key .. "-latex")
 	local tex = dir .. "/math.tex"
 	-- NOTE: the `standalone` class (v1.5a) is incompatible with the new
@@ -394,7 +419,7 @@ local function render_latex(snippet, key, done)
 		"\\usepackage{graphicx}",
 		"\\begin{document}",
 	}
-	vim.list_extend(document, latex_body(snippet))
+	vim.list_extend(document, latex_body(snippet, render_opts and render_opts.inline == true))
 	table.insert(document, "\\end{document}")
 	vim.fn.writefile(document, tex)
 
@@ -442,7 +467,7 @@ local converters = {
 
 -- Bump when generated PNG semantics change. This invalidates old files
 -- generated with the pre-normalized dvipng RGB arguments.
-local CACHE_VERSION = "v2-dvipng-normalized-rgb"
+local CACHE_VERSION = "v3-inline-math"
 
 --------------------------------------------------------------------------------
 -- public conversion API with disk cache
@@ -450,9 +475,11 @@ local CACHE_VERSION = "v2-dvipng-normalized-rgb"
 
 ---@param snippet string
 ---@param backend string
+---@param render_opts table|nil conversion mode options
 ---@return string cache key
-local function cache_key(snippet, backend)
-	return vim.fn.sha256(CACHE_VERSION .. "\0" .. backend .. "\0" .. M.foreground_hex() .. "\0" .. snippet)
+local function cache_key(snippet, backend, render_opts)
+	local mode = render_opts and render_opts.inline == true and "inline" or "block"
+	return vim.fn.sha256(CACHE_VERSION .. "\0" .. backend .. "\0" .. mode .. "\0" .. M.foreground_hex() .. "\0" .. snippet)
 end
 
 ---@param key string
@@ -464,9 +491,10 @@ end
 --- Persistently cached PNG path for a snippet+backend, if already converted.
 ---@param snippet string
 ---@param backend string
+---@param render_opts table|nil conversion mode options
 ---@return string|nil
-function M.cached_path(snippet, backend)
-	local path = cache_path(cache_key(snippet, backend))
+function M.cached_path(snippet, backend, render_opts)
+	local path = cache_path(cache_key(snippet, backend, render_opts))
 	return uv.fs_stat(path) and path or nil
 end
 
@@ -475,14 +503,15 @@ end
 ---
 --- When the backend is configured as a function, the user takes over the
 --- whole invocation: `fn(snippet, o, callback)` where `o` carries
---- `{ foreground_color, background_color, cache_dir }`. The function must
+--- `{ foreground_color, background_color, cache_dir, inline }`. The function must
 --- eventually call `callback(png_path, nil)` -- or simply return a path
 --- string synchronously. The produced PNG is moved into the cache either way.
 ---@param snippet string
 ---@param backend string
 ---@param callback fun(path: string|nil, err: string|nil)
-function M.render(snippet, backend, callback)
-	local key = cache_key(snippet, backend)
+---@param render_opts table|nil conversion mode options
+function M.render(snippet, backend, callback, render_opts)
+	local key = cache_key(snippet, backend, render_opts)
 	local target = cache_path(key)
 
 	if uv.fs_stat(target) then
@@ -538,6 +567,7 @@ function M.render(snippet, backend, callback)
 			foreground_color = M.foreground_hex(),
 			background_color = M.background(),
 			cache_dir = opts.cache_dir,
+			inline = render_opts and render_opts.inline == true or false,
 		}, handle)
 		if not ok then
 			handle(nil, tostring(ret))
@@ -553,7 +583,7 @@ function M.render(snippet, backend, callback)
 		return
 	end
 
-	convert(snippet, key, handle)
+	convert(snippet, key, handle, render_opts)
 end
 
 return M
