@@ -465,6 +465,18 @@ end
 -- per-entry apply / reveal
 --------------------------------------------------------------------------------
 
+--- Hide `entry`'s image and reveal the raw source.
+local function reveal_entry(buf, entry)
+	entry.shown = false
+	clear_image(entry)
+	clear_concealment(buf, entry)
+end
+
+--- Drop `entry` completely (block vanished from the buffer).
+local function destroy_entry(buf, entry)
+	reveal_entry(buf, entry)
+end
+
 --- Pending reposition sweeps per buffer (at most one per scheduler tick).
 local reposition_pending = {}
 
@@ -560,19 +572,7 @@ local function show_entry(buf, entry)
 	end
 end
 
---- Hide `entry`'s image and reveal the raw source.
-local function reveal_entry(buf, entry)
-	entry.shown = false
-	clear_image(entry)
-	clear_concealment(buf, entry)
-end
-
---- Drop `entry` completely (block vanished from the buffer).
-local function destroy_entry(buf, entry)
-	reveal_entry(buf, entry)
-end
-
---------------------------------------------------------------------------------
+------------------------------------------------------------------------------
 -- rendering passes
 --------------------------------------------------------------------------------
 
