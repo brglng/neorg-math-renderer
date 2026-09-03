@@ -228,10 +228,11 @@ wrapped in `\[ ... \]`.
   or directly above the block.
 - The reservation tracks the image height exactly, so following text is
   pushed down by the image height and no blank rows are left behind.
-- Folding or scrolling the document repositions existing images without
-  regenerating their PNG files. If the math block itself is folded, its image
-  and virtual-line reservation move to the visible boundary outside the fold
-  by default; set `hide_on_fold = true` to hide both until the fold opens.
+- CursorMoved, CursorHold, folding and scrolling re-anchor existing images
+  without regenerating their PNG files. If the math block itself is folded,
+  its image and virtual-line reservation move to the visible boundary outside
+  the fold by default; set `hide_on_fold = true` to hide both until the fold
+  opens.
 - If the same buffer is displayed in multiple windows, every window gets
   its own rendered images (new splits pick them up automatically, closed
   windows drop theirs).

@@ -292,11 +292,14 @@ local function reservation_window(buf, entry, preferred_win)
 	return fallback
 end
 
---- Return image/reservation coordinates for one window. Folded blocks use a
---- visible row outside the fold so their virtual lines do not disappear:
+--- Return image/reservation coordinates for one window. Folded blocks use
+--- the visible fold-summary row as the image anchor, so `screenpos` can
+--- resolve the block indentation even when the row after/before the fold is
+--- empty or shorter than that indentation. The reservation itself remains
+--- outside the fold:
 --- below -> above the next visible row, above -> below the previous visible
---- row. At a file edge with no outside anchor, keep the image at the fold
---- summary; there is no following text for it to overlap.
+--- row. At a file edge with no outside anchor, the image covers the fold
+--- summary and there is no following text for it to overlap.
 local function image_placement(buf, entry, win, rows)
 	local folded = entry_fold_info(entry, win)
 	local position = module.config.public.position
@@ -327,12 +330,14 @@ local function image_placement(buf, entry, win, rows)
 	if position == "below" then
 		if next_row < line_count then
 			return {
-				image_row = next_row,
+				-- The fold-summary row is visible and normally contains the
+				-- indented @math tag, so it is a stable horizontal anchor.
+				image_row = folded.start_row,
 				reservation_row = next_row,
 				reservation_above = true,
-				offset = -(rows + 1),
+				offset = 0,
 				folded = true,
-				detach_buffer = false,
+				detach_buffer = true,
 			}
 		end
 		return {
@@ -347,24 +352,26 @@ local function image_placement(buf, entry, win, rows)
 
 	if previous_row >= 0 then
 		return {
-			image_row = previous_row,
+			-- The image starts in the virtual lines below the previous
+			-- visible row and ends immediately before the fold summary.
+			image_row = folded.start_row,
 			reservation_row = previous_row,
 			reservation_above = false,
-			offset = 0,
+			offset = -(rows + 1),
 			folded = true,
-			detach_buffer = false,
+			detach_buffer = true,
 		}
 	end
 	-- There is no row before a fold at the top of the buffer. Prefer a
 	-- visible reservation after the fold over placing an image off-screen.
 	if next_row < line_count then
 		return {
-			image_row = next_row,
+			image_row = folded.start_row,
 			reservation_row = next_row,
 			reservation_above = true,
-			offset = -(rows + 1),
+			offset = 0,
 			folded = true,
-			detach_buffer = false,
+			detach_buffer = true,
 		}
 	end
 	return {
@@ -443,6 +450,18 @@ local function update_reservation(buf, entry, preferred_win)
 	)
 end
 
+--- Return current screen position of a buffer row/column in `win`.
+--- Calling through nvim_win_call avoids cross-window screenpos quirks.
+local function screen_position(win, row, col)
+	local ok, position = pcall(vim.api.nvim_win_call, win, function()
+		return vim.fn.screenpos(win, row + 1, col + 1)
+	end)
+	if not ok or not position or position.row == 0 or position.col == 0 then
+		return nil
+	end
+	return position
+end
+
 --- Render one per-window image with current geometry. image.nvim normally
 --- clears images whose buffer row is inside a fold. A math block image is an
 --- intentional exception: keep it visible at the collapsed block position.
@@ -457,6 +476,11 @@ end
 local function render_entry_image(buf, entry, win, img)
 	local fold = entry_fold_info(entry, win)
 	if fold and module.config.public.hide_on_fold then
+		if img.math_renderer_absolute then
+			img.window = img.math_renderer_window
+			img.inline = img.math_renderer_inline
+			img.math_renderer_absolute = false
+		end
 		img.buffer = buf
 		if not img.hidden_by_fold then
 			pcall(function()
@@ -473,33 +497,48 @@ local function render_entry_image(buf, entry, win, img)
 		rows = image_rows(img)
 	end
 	local placement = image_placement(buf, entry, win, rows)
-	local previous_conceallevel
 
-	if placement.detach_buffer then
-		img.buffer = nil
-		local ok, level = pcall(vim.api.nvim_get_option_value, "conceallevel", { win = win })
-		if ok then
-			previous_conceallevel = level
-			if level >= 2 then
-				pcall(vim.api.nvim_set_option_value, "conceallevel", 0, { win = win })
-			end
+	if placement.folded then
+		local position = screen_position(win, placement.image_row, entry.indent)
+		if not position then
+			return
 		end
-	else
+		if not img.math_renderer_absolute then
+			img.math_renderer_window = img.window or win
+			img.math_renderer_inline = img.inline
+			img.math_renderer_absolute = true
+		end
+		img.window = nil
+		img.inline = false
 		img.buffer = buf
+		img.render_offset_top = 0
+		-- screenpos() reports the fold summary's foldtext column, not the
+		-- hidden source line's indentation. Use the same absolute x formula
+		-- image.nvim uses for its out-of-bounds fallback.
+		local info = vim.fn.getwininfo(win)[1]
+		local absolute_x = position.col - 1
+		if info then
+			absolute_x = info.wincol - 1 + (info.textoff or 0) + entry.indent
+		end
+		pcall(function()
+			img:render({
+				x = absolute_x,
+				y = position.row + placement.offset,
+			})
+		end)
+		return
 	end
-	img.render_offset_top = placement.offset
 
+	if img.math_renderer_absolute then
+		img.window = img.math_renderer_window or win
+		img.inline = img.math_renderer_inline
+		img.math_renderer_absolute = false
+	end
+	img.buffer = buf
+	img.render_offset_top = placement.offset
 	pcall(function()
 		img:render({ x = entry.indent, y = placement.image_row })
 	end)
-
-	if placement.detach_buffer then
-		if previous_conceallevel and previous_conceallevel >= 2 then
-			pcall(vim.api.nvim_set_option_value, "conceallevel", previous_conceallevel, { win = win })
-		end
-	else
-		img.buffer = buf
-	end
 end
 
 local function create_image(buf, entry, win)
@@ -746,7 +785,11 @@ local function update_cursor(buf)
 	if not module.private.do_render then
 		return
 	end
+	-- Cursor events only need a reposition/window sync. Existing PNGs and
+	-- image objects are reused; full_render/backend conversion is never
+	-- called from this path.
 	sync_windows(buf)
+	schedule_reposition(buf)
 end
 
 --- Debounced full render for `buf`.
@@ -880,6 +923,9 @@ local event_handlers = {
 	["core.autocommands.events.cursormoved"] = function(event)
 		update_cursor(event.buffer)
 	end,
+	["core.autocommands.events.cursorhold"] = function(event)
+		update_cursor(event.buffer)
+	end,
 	["core.autocommands.events.textchanged"] = function(event)
 		schedule_render(event.buffer)
 	end,
@@ -909,6 +955,7 @@ module.events.subscribed = {
 		bufwinenter = true,
 		winenter = true,
 		cursormoved = true,
+		cursorhold = true,
 		textchanged = true,
 		insertleave = true,
 		colorscheme = true,
@@ -959,7 +1006,7 @@ module.load = function()
 	end
 
 	-- Enable the autocmds this module reacts to.
-	for _, name in ipairs({ "BufReadPost", "BufWinEnter", "WinEnter", "CursorMoved", "TextChanged", "InsertLeave" }) do
+	for _, name in ipairs({ "BufReadPost", "BufWinEnter", "WinEnter", "CursorMoved", "CursorHold", "TextChanged", "InsertLeave" }) do
 		module.required["core.autocommands"].enable_autocommand(name)
 	end
 	-- ColorScheme is NOT a buffer event: its match field is the colorscheme
