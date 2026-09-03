@@ -501,6 +501,14 @@ local function render_entry_image(buf, entry, win, img)
 	if placement.folded then
 		local position = screen_position(win, placement.image_row, entry.indent)
 		if not position then
+			-- The folded anchor is outside the viewport. Clear the old
+			-- absolute placement; otherwise it stays painted at its previous
+			-- screen row and overlaps whatever has scrolled into view. Keep
+			-- the image object in entry.images so it can render again when
+			-- the fold returns to the viewport.
+			pcall(function()
+				img:clear(true)
+			end)
 			return
 		end
 		if not img.math_renderer_absolute then
