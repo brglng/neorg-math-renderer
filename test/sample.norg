@@ -1,0 +1,87 @@
+@document.meta
+title: neorg-math-renderer manual test
+description: Math blocks of every supported shape. Open with conceallevel=2 and run :Neorg render-math enable
+authors:
+- neorg-math-renderer
+@end
+
+* Plain formulas
+
+A quadratic formula:
+
+@math
+x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}
+@end
+
+An integral identity:
+
+@math
+\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}
+@end
+
+Inline math like $a^2 + b^2 = c^2$ must NOT be rendered -- only @math blocks.
+
+* Alignment content (bare & and \\)
+
+@math
+E &= mc^2 \\
+F &= ma
+@end
+
+* Top-level environments
+
+@math
+\begin{align}
+\nabla \cdot \mathbf{E} &= \frac{\rho}{\varepsilon_0} \\
+\nabla \cdot \mathbf{B} &= 0 \\
+\nabla \times \mathbf{E} &= -\frac{\partial \mathbf{B}}{\partial t} \\
+\nabla \times \mathbf{B} &= \mu_0 \mathbf{J} + \mu_0 \varepsilon_0 \frac{\partial \mathbf{E}}{\partial t}
+\end{align}
+@end
+
+* Second-level environments
+
+A matrix:
+
+@math
+A = \begin{pmatrix}
+a_{11} & a_{12} & \cdots & a_{1n} \\
+a_{21} & a_{22} & \cdots & a_{2n} \\
+\vdots & \vdots & \ddots & \vdots \\
+a_{m1} & a_{m2} & \cdots & a_{mn}
+\end{pmatrix}
+@end
+
+A piecewise function:
+
+@math
+f(x) = \begin{cases}
+x^2 & \text{if } x \ge 0 \\
+-x & \text{if } x < 0
+\end{cases}
+@end
+
+* Text and symbols
+
+@math
+\text{Euler: } e^{i\pi} + 1 = 0 \qquad \alpha \oplus \beta \otimes \gamma
+@end
+
+* Multi-line raw source (conceal check)
+
+The block below has its LaTeX spread over multiple buffer lines; all lines
+should be concealed under the single rendered image.
+
+@math
+\sum_{k=1}^{n} k^2
+= \frac{n(n+1)(2n+1)}{6}
+\qquad
+\sum_{k=1}^{n} k^3 = \left(\frac{n(n+1)}{2}\right)^2
+@end
+
+* Cursor behavior checklist
+
+1. Move the cursor onto a rendered block: the raw source appears, the image
+   hides. Move away: the image returns.
+2. Set @conceallevel=0: rendering stops (raw source everywhere).
+3. Try `:Neorg render-math disable` / `toggle` and watch everything clear.
