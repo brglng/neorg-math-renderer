@@ -113,6 +113,11 @@ module.private = {
 	---               conceal_ids, tag_ids, surplus_ids, filler_id, shown, pending }
 	blocks = {},
 
+	--- Window the currently rendered images are bound to. Images follow the
+	--- cursor's window: when a buffer is shown in multiple windows, only the
+	--- focused window renders them.
+	win = nil,
+
 	--- Per-buffer debounce timer handles.
 	timers = {},
 
@@ -454,11 +459,51 @@ local function create_image(buf, entry)
 	})
 	if ok and img then
 		entry.image = img
+		module.private.win = vim.api.nvim_get_current_win()
 		pcall(function()
 			img:render()
 		end)
 		update_layout(buf, entry)
 	end
+end
+
+--- Clear every image of `buf` and recreate the shown ones bound to the
+--- current window (cached PNGs make this cheap).
+local function rebind_images(buf)
+	for _, entry in pairs(module.private.blocks[buf] or {}) do
+		if entry.shown and entry.png then
+			create_image(buf, entry)
+		elseif entry.image then
+			clear_image(entry)
+		end
+	end
+end
+
+--- Make images follow the cursor's window: when `buf` is displayed in more
+--- than one window, only the focused window keeps rendered images; when a
+--- split is closed again, images rebind to the remaining window if they were
+--- bound to the closed one. Returns true when a rebind happened.
+local function sync_window(buf)
+	local cur = vim.api.nvim_get_current_win()
+	local wins = vim.fn.win_findbuf(buf)
+
+	if #wins <= 1 then
+		-- single window: only rebind if the images are bound elsewhere (e.g.
+		-- the other window of a former split was just closed)
+		if module.private.win ~= nil and module.private.win ~= cur then
+			module.private.win = cur
+			rebind_images(buf)
+			return true
+		end
+		return false
+	end
+
+	if module.private.win == cur then
+		return false
+	end
+	module.private.win = cur
+	rebind_images(buf)
+	return true
 end
 
 --------------------------------------------------------------------------------
@@ -655,6 +700,9 @@ local function update_cursor(buf)
 		return
 	end
 
+	-- focus may have moved to another window showing this buffer
+	sync_window(buf)
+
 	local row = vim.api.nvim_win_get_cursor(0)[1] - 1
 	local conceal_ok = (vim.wo.conceallevel or 0) >= 2
 	local changed = false
@@ -794,6 +842,7 @@ local event_handlers = {
 		end
 	end,
 	["core.autocommands.events.bufwinenter"] = function(event)
+		sync_window(event.buffer)
 		-- First entry into a buffer we have not rendered yet (e.g. BufReadPost
 		-- fired before the module loaded or before ft was set to norg): render
 		-- it now. full_render records state even for block-less buffers, so
@@ -801,6 +850,10 @@ local event_handlers = {
 		if module.private.do_render and module.private.blocks[event.buffer] == nil then
 			full_render(event.buffer)
 		end
+		show_hidden(event.buffer)
+	end,
+	["core.autocommands.events.winenter"] = function(event)
+		sync_window(event.buffer)
 		show_hidden(event.buffer)
 	end,
 	["core.autocommands.events.cursormoved"] = function(event)
@@ -828,6 +881,7 @@ module.events.subscribed = {
 	["core.autocommands"] = {
 		bufreadpost = true,
 		bufwinenter = true,
+		winenter = true,
 		cursormoved = true,
 		textchanged = true,
 		insertleave = true,
@@ -879,7 +933,7 @@ module.load = function()
 	end
 
 	-- Enable the autocmds this module reacts to.
-	for _, name in ipairs({ "BufReadPost", "BufWinEnter", "CursorMoved", "TextChanged", "InsertLeave", "Colorscheme" }) do
+	for _, name in ipairs({ "BufReadPost", "BufWinEnter", "WinEnter", "CursorMoved", "TextChanged", "InsertLeave", "Colorscheme" }) do
 		module.required["core.autocommands"].enable_autocommand(name)
 	end
 
