@@ -465,6 +465,34 @@ end
 -- per-entry apply / reveal
 --------------------------------------------------------------------------------
 
+--- Pending reposition sweeps per buffer (at most one per scheduler tick).
+local reposition_pending = {}
+
+--- Re-render every image in `buf` on the next scheduler tick. Revealing or
+--- concealing one block changes the number of screen rows ABOVE other blocks
+--- (and image.nvim only recomputes screen positions when an image is
+--- rendered -- its decoration provider does not fire on extmark-caused row
+--- shifts), so every layout change needs an explicit reposition sweep.
+local function schedule_reposition(buf)
+	if reposition_pending[buf] then
+		return
+	end
+	reposition_pending[buf] = true
+	vim.schedule(function()
+		reposition_pending[buf] = nil
+		if not module.private.do_render or not vim.api.nvim_buf_is_valid(buf) then
+			return
+		end
+		for _, entry in pairs(module.private.blocks[buf] or {}) do
+			if entry.image then
+				pcall(function()
+					entry.image:render()
+				end)
+			end
+		end
+	end)
+end
+
 --- Show `entry`: conceal the source and make sure the image is rendered.
 local function show_entry(buf, entry)
 	if entry.shown then
@@ -526,6 +554,8 @@ local function show_entry(buf, entry)
 			else
 				create_image(buf, entry)
 			end
+			-- The new image (and its filler) shifts every block below it.
+			schedule_reposition(buf)
 		end)
 	end
 end
@@ -614,6 +644,7 @@ local function full_render(buf)
 	end
 
 	module.private.blocks[buf] = state
+	schedule_reposition(buf)
 end
 
 --- Light pass on cursor movement: only toggle reveal/conceal for blocks the
@@ -626,6 +657,7 @@ local function update_cursor(buf)
 
 	local row = vim.api.nvim_win_get_cursor(0)[1] - 1
 	local conceal_ok = (vim.wo.conceallevel or 0) >= 2
+	local changed = false
 
 	for _, entry in pairs(state) do
 		local want_shown = conceal_ok and entry.has_content and not cursor_inside(entry, row)
@@ -635,7 +667,13 @@ local function update_cursor(buf)
 			else
 				reveal_entry(buf, entry)
 			end
+			changed = true
 		end
+	end
+
+	-- A reveal/conceal toggles screen rows; every other image must re-anchor.
+	if changed then
+		schedule_reposition(buf)
 	end
 end
 
