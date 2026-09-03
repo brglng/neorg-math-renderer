@@ -232,6 +232,10 @@ wrapped in `\[ ... \]`.
   cursor moved into.
 - With `conceal_math_tags = true`, the `@math` / `@end` lines are hidden
   entirely (Neovim >= 0.11 uses whole-row `conceal_lines` hiding).
+- Images wiped by floating UI recover automatically: command line float
+  (`CmdlineLeave`), any closing window incl. notification popups
+  (`WinClosed`), or a manual `doautocmd User NeorgMathRendererRedraw` /
+  `public.redraw()`.
 - Rendering is skipped entirely when `conceallevel < 2`, since the image
   would just overlap visible source text.
 

@@ -542,12 +542,36 @@ local function schedule_reposition(buf)
 		end
 		for _, entry in pairs(module.private.blocks[buf] or {}) do
 			if entry.image then
+				-- render with the entry's CURRENT anchor: a bare render() would
+				-- keep a stale geometry and pin the image to an outdated row
 				pcall(function()
-					entry.image:render()
+					entry.image:render({ x = entry.indent, y = entry.anchor_row })
 				end)
 			end
 		end
 	end)
+end
+
+--- Full refresh of `buf`: recreate every shown image from its cached PNG.
+--- Used after floating UI (command-line or notification popups) wiped the
+--- terminal cells: recreating bypasses any stale render state a plain
+--- re-render might hit. Deferred so the UI finishes its own teardown first,
+--- and retried while a command-line UI is still active.
+local function deep_redraw(buf)
+	vim.defer_fn(function()
+		if not module.private.do_render or not vim.api.nvim_buf_is_valid(buf) then
+			return
+		end
+		if vim.fn.getcmdwintype() ~= "" or vim.api.nvim_get_mode().mode:find("^c") then
+			deep_redraw(buf)
+			return
+		end
+		for _, entry in pairs(module.private.blocks[buf] or {}) do
+			if entry.shown and entry.png then
+				create_image(buf, entry)
+			end
+		end
+	end, 100)
 end
 
 --- Show `entry`: conceal the source and make sure the image is rendered.
@@ -937,6 +961,45 @@ module.load = function()
 		module.required["core.autocommands"].enable_autocommand(name)
 	end
 
+	-- Float-based command-line UIs (e.g. noice.nvim) repaint the screen when
+	-- the command line opens and closes, wiping the terminal cells the images
+	-- were drawn on. image.nvim does not redraw on its own (no scroll or
+	-- topline change), so refresh once the command line is left.
+	local aug = vim.api.nvim_create_augroup("neorg-math-renderer", { clear = true })
+	vim.api.nvim_create_autocmd({ "CmdlineLeave", "CmdwinLeave" }, {
+		group = aug,
+		callback = function()
+			local buf = vim.api.nvim_get_current_buf()
+			if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
+				deep_redraw(buf)
+			end
+		end,
+	})
+
+	-- Notification popups and other floating UI wipe images the same way
+	-- when they close; WinClosed fires for every floating window, so this
+	-- stays fully event-driven (no timer).
+	vim.api.nvim_create_autocmd("WinClosed", {
+		group = aug,
+		callback = function()
+			local buf = vim.api.nvim_get_current_buf()
+			if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
+				deep_redraw(buf)
+			end
+		end,
+	})
+
+	-- Manual redraw hook: `doautocmd User NeorgMathRendererRedraw` (or
+	-- module.public.redraw()) forces a sweep, e.g. from an autocmd of a
+	-- specific notification plugin.
+	vim.api.nvim_create_autocmd("User", {
+		group = aug,
+		pattern = "NeorgMathRendererRedraw",
+		callback = function()
+			module.public.redraw()
+		end,
+	})
+
 	modules.await("core.neorgcmd", function(neorgcmd)
 		neorgcmd.add_commands_from_table({
 			["render-math"] = {
@@ -986,6 +1049,15 @@ module.public = {
 	--- Name of the resolved backend, or nil if none was found.
 	get_backend = function()
 		return module.private.backend
+	end,
+
+	--- Force a full refresh of the current buffer's images. Use when some
+	--- floating UI wiped the terminal cells they were drawn on and no
+	--- WinClosed/CmdlineLeave event fired for it.
+	redraw = function()
+		if module.private.do_render then
+			deep_redraw(vim.api.nvim_get_current_buf())
+		end
 	end,
 }
 
