@@ -92,6 +92,10 @@ All options (defaults shown):
     -- "below" (default) or "above".
     position = "below",
 
+    -- Keep the image when the math block is folded (default). Set true to
+    -- hide the image and remove its virtual-line reservation while folded.
+    hide_on_fold = false,
+
     -- LaTeX-to-PNG backends in preference order. The first backend whose
     -- probe succeeds is used.
     backends = { "ratex", "tex2svg", "latex" },
@@ -103,9 +107,9 @@ All options (defaults shown):
     -- dvipng density for the traditional `latex` backend.
     dpi = 350,
 
-    -- Foreground color as "#rrggbb". nil = foreground of the
-    -- `@norg.rendered.latex` highlight group (following its link, so it
-    -- tracks your colorscheme; fallback: black).
+    -- Foreground color as "#rrggbb". nil = foreground of
+    -- `@neorg.rendered.latex` (following its link, so it tracks your
+    -- colorscheme; fallback: 50% grey, matching core.latex.renderer).
     foreground_color = nil,
 
     -- Background of rendered formulas: "transparent" or "#rrggbb".
@@ -185,6 +189,7 @@ ratex = function(snippet, opts, callback)
       end)
     end)
 end,
+```
 
 ### tex2svg (MathJax)
 
@@ -223,6 +228,10 @@ wrapped in `\[ ... \]`.
   or directly above the block.
 - The reservation tracks the image height exactly, so following text is
   pushed down by the image height and no blank rows are left behind.
+- Folding or scrolling the document repositions existing images without
+  regenerating their PNG files. If the math block itself is folded, its image
+  and virtual-line reservation move to the visible boundary outside the fold
+  by default; set `hide_on_fold = true` to hide both until the fold opens.
 - If the same buffer is displayed in multiple windows, every window gets
   its own rendered images (new splits pick them up automatically, closed
   windows drop theirs).

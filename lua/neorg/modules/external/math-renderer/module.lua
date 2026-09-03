@@ -11,10 +11,9 @@ into a PNG image and displaying it in place with
 
 Toggle rendering with `:Neorg render-math enable|disable|toggle`.
 
-Rendering requires `conceallevel >= 2` in the norg window: the block's source
-lines are concealed character-by-character underneath the image. When the
-cursor moves inside a block, the raw LaTeX source is revealed and the image is
-hidden until the cursor leaves.
+The LaTeX source stays visible. The rendered image is placed on reserved
+virtual lines above or below the block; when the block is folded, the image
+and its reservation move to a visible boundary outside the fold.
 
 Image backends are probed in the configured `backends` preference order:
 
@@ -57,6 +56,10 @@ module.config.public = {
 	-- visible; the image occupies reserved virtual lines next to it.
 	position = "below",
 
+	-- Keep the formula image visible when its math block is folded. Set this
+	-- true to hide the image and remove its virtual-line reservation instead.
+	hide_on_fold = false,
+
 	-- LaTeX-to-PNG backends in preference order. The first backend whose
 	-- executables are found is used for every block.
 	--   "ratex"   -> `ratex-render` (RaTeX CLI, KaTeX-compatible, pure Rust)
@@ -74,8 +77,8 @@ module.config.public = {
 	dpi = 350,
 
 	-- Foreground color of rendered formulas as "#rrggbb". When nil, the
-	-- foreground of the `@norg.rendered.latex` highlight group is used
-	-- (falling back to black), like neorg's own latex renderer.
+	-- foreground of `@neorg.rendered.latex` is used (falling back to 50%
+	-- grey), matching core.latex.renderer.
 	foreground_color = nil,
 
 	-- Background of rendered formulas: "transparent" (default) or "#rrggbb".
@@ -102,7 +105,7 @@ module.private = {
 	--- image.nvim module, or nil when the plugin is missing.
 	image = nil,
 
-	--- Extmark namespace used for all concealment placed by this module.
+	--- Extmark namespace used for image row reservations.
 	ns = nil,
 
 	--- Whether rendering is currently active.
@@ -230,17 +233,6 @@ local function clear_image(entry)
 	end
 end
 
---- Terminal rows an image with `px` pixel height occupies.
-local function px_to_rows(px)
-	local ok_term, term = pcall(function()
-		return require("image.utils.term").get_size()
-	end)
-	if ok_term and term and term.cell_height and px and px > 0 then
-		return math.max(1, math.floor(px / term.cell_height))
-	end
-	return 1
-end
-
 --- Terminal rows the rendered image occupies: prefer the height reported
 --- by the last successful render, fall back to a pixel estimate.
 local function image_rows(img)
@@ -262,23 +254,170 @@ local function image_rows(img)
 	return 1
 end
 
---- Reserve the screen rows the image occupies: virtual lines directly
---- above ("above") or below ("below") the block. The source stays fully
---- visible; nothing is concealed.
-local function update_reservation(buf, entry)
-	if entry.reservation_id then
-		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, entry.reservation_id)
-		entry.reservation_id = nil
+--- Return the closed fold containing `entry` in `win`, if any.
+--- Fold state is window-local, so every per-window image needs its own check.
+local function entry_fold_info(entry, win)
+	if not vim.api.nvim_win_is_valid(win) then
+		return nil
 	end
-	if not next(entry.images) then
-		return
+	local ok, info = pcall(vim.api.nvim_win_call, win, function()
+		local start_row = vim.fn.foldclosed(entry.math_row + 1)
+		if start_row == -1 then
+			return nil
+		end
+		return {
+			start_row = start_row - 1,
+			end_row = vim.fn.foldclosedend(entry.math_row + 1) - 1,
+		}
+	end)
+	return ok and info or nil
+end
+
+--- Choose the visible image/window used for the buffer-wide reservation.
+--- Virtual lines are buffer-scoped, so different fold states in different
+--- windows cannot have independent reservation anchors; prefer the current
+--- window, then any non-hidden image.
+local function reservation_window(buf, entry, preferred_win)
+	local current = preferred_win or vim.api.nvim_get_current_win()
+	local fallback
+	for win in pairs(entry.images) do
+		local folded = entry_fold_info(entry, win)
+		if not (module.config.public.hide_on_fold and folded) then
+			fallback = fallback or win
+			if win == current then
+				return win
+			end
+		end
+	end
+	return fallback
+end
+
+--- Return image/reservation coordinates for one window. Folded blocks use a
+--- visible row outside the fold so their virtual lines do not disappear:
+--- below -> above the next visible row, above -> below the previous visible
+--- row. At a file edge with no outside anchor, keep the image at the fold
+--- summary; there is no following text for it to overlap.
+local function image_placement(buf, entry, win, rows)
+	local folded = entry_fold_info(entry, win)
+	local position = module.config.public.position
+	if not folded then
+		if position == "above" then
+			return {
+				image_row = entry.math_row,
+				reservation_row = entry.math_row,
+				reservation_above = true,
+				offset = -(rows + 1),
+				folded = false,
+				detach_buffer = false,
+			}
+		end
+		return {
+			image_row = entry.erow,
+			reservation_row = entry.erow,
+			reservation_above = false,
+			offset = 0,
+			folded = false,
+			detach_buffer = false,
+		}
 	end
 
-	local rows = 0
-	for _, img in pairs(entry.images) do
-		rows = math.max(rows, image_rows(img))
+	local line_count = vim.api.nvim_buf_line_count(buf)
+	local next_row = folded.end_row + 1
+	local previous_row = folded.start_row - 1
+	if position == "below" then
+		if next_row < line_count then
+			return {
+				image_row = next_row,
+				reservation_row = next_row,
+				reservation_above = true,
+				offset = -(rows + 1),
+				folded = true,
+				detach_buffer = false,
+			}
+		end
+		return {
+			image_row = folded.start_row,
+			reservation_row = nil,
+			reservation_above = false,
+			offset = 0,
+			folded = true,
+			detach_buffer = true,
+		}
 	end
-	if rows == 0 then
+
+	if previous_row >= 0 then
+		return {
+			image_row = previous_row,
+			reservation_row = previous_row,
+			reservation_above = false,
+			offset = 0,
+			folded = true,
+			detach_buffer = false,
+		}
+	end
+	-- There is no row before a fold at the top of the buffer. Prefer a
+	-- visible reservation after the fold over placing an image off-screen.
+	if next_row < line_count then
+		return {
+			image_row = next_row,
+			reservation_row = next_row,
+			reservation_above = true,
+			offset = -(rows + 1),
+			folded = true,
+			detach_buffer = false,
+		}
+	end
+	return {
+		image_row = folded.start_row,
+		reservation_row = nil,
+		reservation_above = false,
+		offset = 0,
+		folded = true,
+		detach_buffer = true,
+	}
+end
+
+--- Reserve the screen rows the image occupies. Reservations are normally
+--- attached to the block boundary; when the block is folded, the chosen
+--- anchor moves outside the fold so virtual lines remain visible.
+local function update_reservation(buf, entry, preferred_win)
+	local chosen_win = reservation_window(buf, entry, preferred_win)
+	local old_key = entry.reservation_key
+	local old_id = entry.reservation_id
+	local old_rows = entry.reservation_rows
+
+	local rows = 0
+	if chosen_win then
+		for win, img in pairs(entry.images) do
+			if not (module.config.public.hide_on_fold and entry_fold_info(entry, win)) then
+				rows = math.max(rows, image_rows(img))
+			end
+		end
+	end
+
+	local placement = chosen_win and image_placement(buf, entry, chosen_win, rows) or nil
+	local key = placement and ("%s:%s:%d"):format(
+		tostring(placement.reservation_row),
+		tostring(placement.reservation_above),
+		rows
+	) or "none"
+
+	entry.reservation_rows = rows
+	entry.reservation_row = placement and placement.reservation_row or nil
+	entry.reservation_above = placement and placement.reservation_above or false
+	if old_key == key and old_id then
+		local ok, mark = pcall(vim.api.nvim_buf_get_extmark_by_id, buf, module.private.ns, old_id, {})
+		if ok and mark and #mark > 0 and old_rows == rows then
+			return
+		end
+	end
+
+	if old_id then
+		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, old_id)
+		entry.reservation_id = nil
+	end
+	entry.reservation_key = key
+	if not placement or not placement.reservation_row or rows == 0 then
 		return
 	end
 
@@ -286,22 +425,80 @@ local function update_reservation(buf, entry)
 	for _ = 1, rows do
 		filler[#filler + 1] = { { "", "" } }
 	end
+	local opts = {
+		virt_lines = filler,
+		strict = false,
+		undo_restore = false,
+		invalidate = true,
+	}
+	if placement.reservation_above then
+		opts.virt_lines_above = true
+	end
+	entry.reservation_id = vim.api.nvim_buf_set_extmark(
+		buf,
+		module.private.ns,
+		placement.reservation_row,
+		0,
+		opts
+	)
+end
 
-	if module.config.public.position == "above" then
-		entry.reservation_id = vim.api.nvim_buf_set_extmark(buf, module.private.ns, entry.math_row, 0, {
-			virt_lines = filler,
-			virt_lines_above = true,
-			strict = false,
-			undo_restore = false,
-			invalidate = true,
-		})
+--- Render one per-window image with current geometry. image.nvim normally
+--- clears images whose buffer row is inside a fold. A math block image is an
+--- intentional exception: keep it visible at the collapsed block position.
+--- Temporarily detaching `image.buffer` bypasses image.nvim's fold guard and
+--- also keeps its decoration provider from trying to clear this image while
+--- the fold remains closed. The association is restored when the fold opens.
+---
+--- image.nvim's conceal-column correction expects a buffer whenever the
+--- window conceallevel is >= 2, even though this module no longer conceals
+--- source text. Temporarily lower that window-local option for the folded
+--- render only, then restore the user's value.
+local function render_entry_image(buf, entry, win, img)
+	local fold = entry_fold_info(entry, win)
+	if fold and module.config.public.hide_on_fold then
+		img.buffer = buf
+		if not img.hidden_by_fold then
+			pcall(function()
+				img:clear()
+			end)
+		end
+		img.hidden_by_fold = true
+		return
+	end
+
+	img.hidden_by_fold = false
+	local rows = entry.reservation_rows
+	if type(rows) ~= "number" or rows <= 0 then
+		rows = image_rows(img)
+	end
+	local placement = image_placement(buf, entry, win, rows)
+	local previous_conceallevel
+
+	if placement.detach_buffer then
+		img.buffer = nil
+		local ok, level = pcall(vim.api.nvim_get_option_value, "conceallevel", { win = win })
+		if ok then
+			previous_conceallevel = level
+			if level >= 2 then
+				pcall(vim.api.nvim_set_option_value, "conceallevel", 0, { win = win })
+			end
+		end
 	else
-		entry.reservation_id = vim.api.nvim_buf_set_extmark(buf, module.private.ns, entry.erow, 0, {
-			virt_lines = filler,
-			strict = false,
-			undo_restore = false,
-			invalidate = true,
-		})
+		img.buffer = buf
+	end
+	img.render_offset_top = placement.offset
+
+	pcall(function()
+		img:render({ x = entry.indent, y = placement.image_row })
+	end)
+
+	if placement.detach_buffer then
+		if previous_conceallevel and previous_conceallevel >= 2 then
+			pcall(vim.api.nvim_set_option_value, "conceallevel", previous_conceallevel, { win = win })
+		end
+	else
+		img.buffer = buf
 	end
 end
 
@@ -310,14 +507,14 @@ local function create_image(buf, entry, win)
 		return
 	end
 
-		-- The image is anchored OUTSIDE the block, on its reserved virtual
-		-- lines: "below" sits on the lines reserved after @end, "above"
-		-- covers the lines reserved before @math (render_offset_top shifts
-		-- it up by its own height, set right after creation).
-		position = module.config.public.position
-		y = (position == "above") and entry.math_row or entry.erow
+	-- The image is anchored OUTSIDE the block, on its reserved virtual
+	-- lines: "below" sits on the lines reserved after @end, "above"
+	-- covers the lines reserved before @math (render_offset_top shifts
+	-- it up by its own height, set right after creation).
+	local position = module.config.public.position
+	local y = (position == "above") and entry.math_row or entry.erow
 
-		local ok, img = pcall(module.private.image.from_file, entry.png, {
+	local ok, img = pcall(module.private.image.from_file, entry.png, {
 		window = win,
 		buffer = buf,
 		inline = true,
@@ -332,16 +529,10 @@ local function create_image(buf, entry, win)
 		max_height_window_percentage = module.config.public.fit_window and 100 or 100000,
 	})
 	if ok and img then
-		if position == "above" then
-			img.render_offset_top = -(px_to_rows(img.image_height) + 1)
-		else
-			img.render_offset_top = 0
-		end
 		entry.images[win] = img
-		pcall(function()
-			img:render()
-		end)
-		update_reservation(buf, entry)
+		-- Establish the fold-aware reservation before calculating screenpos.
+		update_reservation(buf, entry, win)
+		render_entry_image(buf, entry, win, img)
 	end
 end
 
@@ -394,29 +585,38 @@ end
 
 --- Pending reposition sweeps per buffer (at most one per scheduler tick).
 local reposition_pending = {}
+local reposition_preferred = {}
 
---- Re-render every image in `buf` on the next scheduler tick. Revealing or
---- concealing one block changes the number of screen rows ABOVE other blocks
---- (and image.nvim only recomputes screen positions when an image is
---- rendered -- its decoration provider does not fire on extmark-caused row
---- shifts), so every layout change needs an explicit reposition sweep.
-local function schedule_reposition(buf)
+--- Re-render every image in `buf` on the next scheduler tick. Fold changes,
+--- virtual-line reservation moves and other viewport layout changes can move
+--- images without changing buffer rows, so every such change needs an
+--- explicit reposition sweep.
+---@param buf integer
+---@param preferred_win? integer window whose fold state should drive the
+--- buffer-wide reservation
+local function schedule_reposition(buf, preferred_win)
+	if preferred_win then
+		reposition_preferred[buf] = preferred_win
+	end
 	if reposition_pending[buf] then
 		return
 	end
 	reposition_pending[buf] = true
 	vim.schedule(function()
 		reposition_pending[buf] = nil
+		local reservation_win = reposition_preferred[buf]
+		reposition_preferred[buf] = nil
 		if not module.private.do_render or not vim.api.nvim_buf_is_valid(buf) then
 			return
 		end
 		for _, entry in pairs(module.private.blocks[buf] or {}) do
-			for _, img in pairs(entry.images) do
+			-- Fold state can change the reservation anchor, so update it before
+			-- rendering any image against screenpos.
+			update_reservation(buf, entry, reservation_win)
+			for win, img in pairs(entry.images) do
 				-- render with the entry's CURRENT anchor: a bare render() would
 				-- keep a stale geometry and pin the image to an outdated row
-				pcall(function()
-					img:render({ x = entry.indent, y = entry.anchor_row })
-				end)
+				render_entry_image(buf, entry, win, img)
 			end
 		end
 	end)
@@ -489,7 +689,7 @@ end
 --------------------------------------------------------------------------------
 
 --- Full render of the current buffer: re-discover blocks, reconcile state,
---- and apply concealment/images to every block.
+--- and apply images/reservations to every block.
 local function full_render(buf)
 	if not module.private.do_render or not vim.api.nvim_buf_is_valid(buf) then
 		return
@@ -619,10 +819,9 @@ local function show_hidden(buf)
 	-- with fresh geometry when a window re-enters the buffer.
 	for _, entry in pairs(module.private.blocks[buf] or {}) do
 		if entry.shown then
-			for _, img in pairs(entry.images) do
-				pcall(function()
-					img:render({ x = entry.indent, y = entry.anchor_row })
-				end)
+			update_reservation(buf, entry)
+			for win, img in pairs(entry.images) do
+				render_entry_image(buf, entry, win, img)
 			end
 		end
 	end
@@ -774,6 +973,47 @@ module.load = function()
 	-- topline change), so refresh once the command line is left.
 	local aug = vim.api.nvim_create_augroup("neorg-math-renderer", { clear = true })
 
+	-- Fold changes can move every image without changing any buffer row.
+	-- Neovim has no FoldClosed/FoldOpened events; WinScrolled is the
+	-- supported signal for this viewport change. Re-sync windows first, then
+	-- reposition all existing images on the next tick.
+	vim.api.nvim_create_autocmd("WinScrolled", {
+		group = aug,
+		callback = function(event)
+			local buf = event.buf
+			if not vim.api.nvim_buf_is_valid(buf) or vim.bo[buf].ft ~= "norg" then
+				return
+			end
+			local win = tonumber(event.match) or vim.api.nvim_get_current_win()
+			vim.schedule(function()
+				if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
+					sync_windows(buf)
+					schedule_reposition(buf, win)
+				end
+			end)
+		end,
+	})
+
+	-- Folded images temporarily detach their buffer association to bypass
+	-- image.nvim's fold guard. Clean them explicitly when a window leaves the
+	-- buffer, because image.nvim cannot perform its normal buffer-mismatch
+	-- cleanup while that association is detached.
+	vim.api.nvim_create_autocmd("BufLeave", {
+		group = aug,
+		callback = function(event)
+			local buf = event.buf
+			if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
+				-- BufLeave fires before the window has switched buffers, so
+				-- defer until win_findbuf() sees the post-leave window set.
+				vim.schedule(function()
+					if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
+						sync_windows(buf)
+					end
+				end)
+			end
+		end,
+	})
+
 	-- `set background=light/dark` changes the resolved foreground without a
 	-- ColorScheme event (e.g. when only a scheme's variant is toggled).
 	vim.api.nvim_create_autocmd("OptionSet", {
@@ -783,6 +1023,7 @@ module.load = function()
 			colorscheme_changed()
 		end,
 	})
+
 	vim.api.nvim_create_autocmd({ "CmdlineLeave", "CmdwinLeave" }, {
 		group = aug,
 		callback = function()
@@ -848,7 +1089,7 @@ module.public = {
 		end
 	end,
 
-	--- Clear all images and concealment from `buf` (defaults to current).
+	--- Clear all images and row reservations from `buf` (defaults to current).
 	clear = function(buf)
 		buf = buf or vim.api.nvim_get_current_buf()
 		local state = module.private.blocks[buf] or {}
@@ -857,8 +1098,6 @@ module.public = {
 		end
 		for _, entry in pairs(state) do
 			clear_image(entry)
-			entry.conceal_ids = {}
-			entry.surplus_ids = {}
 			entry.shown = false
 		end
 	end,
