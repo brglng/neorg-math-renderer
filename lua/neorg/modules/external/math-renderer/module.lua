@@ -109,14 +109,10 @@ module.private = {
 	do_render = false,
 
 	--- Per-buffer block state: bufnr -> { [math_row] = entry }.
-	--- Each entry: { math_row, erow, indent, anchor_row, snippet, png, image,
-	---               conceal_ids, tag_ids, surplus_ids, filler_id, shown, pending }
+	--- Each entry: { math_row, erow, indent, anchor_row, snippet, png,
+	---               images (winid -> image), conceal_ids, tag_ids,
+	---               surplus_ids, filler_id, shown, pending }
 	blocks = {},
-
-	--- Window the currently rendered images are bound to. Images follow the
-	--- cursor's window: when a buffer is shown in multiple windows, only the
-	--- focused window renders them.
-	win = nil,
 
 	--- Per-buffer debounce timer handles.
 	timers = {},
@@ -329,13 +325,14 @@ end
 -- image management
 --------------------------------------------------------------------------------
 
---- Destroy the image object of `entry` (if any).
+--- Destroy all image objects of `entry` (one per window displaying the
+--- buffer).
 local function clear_image(entry)
-	if entry.image then
+	for win, img in pairs(entry.images or {}) do
 		pcall(function()
-			entry.image:clear()
+			img:clear()
 		end)
-		entry.image = nil
+		entry.images[win] = nil
 	end
 end
 
@@ -401,10 +398,16 @@ local function update_layout(buf, entry)
 		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, id)
 	end
 	entry.surplus_ids = {}
-	if not entry.image then
+
+	-- Filler/surplus are buffer-wide; size them for the tallest per-window
+	-- rendering so no window's image overlaps following text.
+	local rows = 0
+	for _, img in pairs(entry.images) do
+		rows = math.max(rows, image_rows(img))
+	end
+	if rows == 0 then
 		return
 	end
-	local rows = image_rows(entry.image)
 	local covered = entry.erow - entry.anchor_row
 
 	-- image shorter than the content: vanish the surplus source rows
@@ -428,15 +431,17 @@ local function update_layout(buf, entry)
 	end
 end
 
---- Create and render the image for `entry` from its cached PNG.
-local function create_image(buf, entry)
-	if not module.private.image or not entry.png then
+--- Create and render the image of `entry` bound to window `win` from its
+--- cached PNG. image.nvim binds an image to a single window, so every
+--- window displaying the buffer gets its own object (from_file clones the
+--- cached processed image, so this is cheap).
+local function create_image(buf, entry, win)
+	if not module.private.image or not entry.png or entry.images[win] then
 		return
 	end
-	clear_image(entry)
 
 	local ok, img = pcall(module.private.image.from_file, entry.png, {
-		window = vim.api.nvim_get_current_win(),
+		window = win,
 		buffer = buf,
 		inline = true,
 		-- Space is managed by this module: the concealed content rows provide
@@ -458,8 +463,7 @@ local function create_image(buf, entry)
 		max_height_window_percentage = module.config.public.fit_window and 100 or 100000,
 	})
 	if ok and img then
-		entry.image = img
-		module.private.win = vim.api.nvim_get_current_win()
+		entry.images[win] = img
 		pcall(function()
 			img:render()
 		end)
@@ -467,43 +471,35 @@ local function create_image(buf, entry)
 	end
 end
 
---- Clear every image of `buf` and recreate the shown ones bound to the
---- current window (cached PNGs make this cheap).
-local function rebind_images(buf)
-	for _, entry in pairs(module.private.blocks[buf] or {}) do
-		if entry.shown and entry.png then
-			create_image(buf, entry)
-		elseif entry.image then
-			clear_image(entry)
+--- Make sure `entry` has an image for every window currently displaying the
+--- buffer, and none for windows that no longer do.
+local function ensure_entry_images(buf, entry)
+	local wins = vim.fn.win_findbuf(buf)
+	local live = {}
+	for _, w in ipairs(wins) do
+		live[w] = true
+	end
+	for w, img in pairs(entry.images) do
+		if not live[w] then
+			pcall(function()
+				img:clear()
+			end)
+			entry.images[w] = nil
+		end
+	end
+	if entry.shown and entry.png then
+		for _, w in ipairs(wins) do
+			create_image(buf, entry, w)
 		end
 	end
 end
 
---- Make images follow the cursor's window: when `buf` is displayed in more
---- than one window, only the focused window keeps rendered images; when a
---- split is closed again, images rebind to the remaining window if they were
---- bound to the closed one. Returns true when a rebind happened.
-local function sync_window(buf)
-	local cur = vim.api.nvim_get_current_win()
-	local wins = vim.fn.win_findbuf(buf)
-
-	if #wins <= 1 then
-		-- single window: only rebind if the images are bound elsewhere (e.g.
-		-- the other window of a former split was just closed)
-		if module.private.win ~= nil and module.private.win ~= cur then
-			module.private.win = cur
-			rebind_images(buf)
-			return true
-		end
-		return false
+--- Sync every entry of `buf` with the set of windows displaying it: new
+--- splits get images, closed windows drop theirs.
+local function sync_windows(buf)
+	for _, entry in pairs(module.private.blocks[buf] or {}) do
+		ensure_entry_images(buf, entry)
 	end
-
-	if module.private.win == cur then
-		return false
-	end
-	module.private.win = cur
-	rebind_images(buf)
-	return true
 end
 
 --------------------------------------------------------------------------------
@@ -541,11 +537,11 @@ local function schedule_reposition(buf)
 			return
 		end
 		for _, entry in pairs(module.private.blocks[buf] or {}) do
-			if entry.image then
+			for _, img in pairs(entry.images) do
 				-- render with the entry's CURRENT anchor: a bare render() would
 				-- keep a stale geometry and pin the image to an outdated row
 				pcall(function()
-					entry.image:render({ x = entry.indent, y = entry.anchor_row })
+					img:render({ x = entry.indent, y = entry.anchor_row })
 				end)
 			end
 		end
@@ -568,7 +564,8 @@ local function deep_redraw(buf)
 		end
 		for _, entry in pairs(module.private.blocks[buf] or {}) do
 			if entry.shown and entry.png then
-				create_image(buf, entry)
+				clear_image(entry)
+				ensure_entry_images(buf, entry)
 			end
 		end
 	end, 100)
@@ -598,7 +595,7 @@ local function show_entry(buf, entry)
 	end
 
 	if entry.png then
-		create_image(buf, entry)
+		ensure_entry_images(buf, entry)
 	elseif not entry.pending and entry.has_content then
 		entry.pending = true
 		local snippet = entry.snippet
@@ -633,7 +630,7 @@ local function show_entry(buf, entry)
 			if not entry.shown then
 				show_entry(buf, entry)
 			else
-				create_image(buf, entry)
+				ensure_entry_images(buf, entry)
 			end
 			-- The new image (and its filler) shifts every block below it.
 			schedule_reposition(buf)
@@ -675,7 +672,7 @@ local function full_render(buf)
 				snippet = want.snippet,
 				has_content = want.has_content,
 				png = nil,
-				image = nil,
+				images = {},
 				conceal_ids = {},
 				tag_ids = {},
 				surplus_ids = {},
@@ -725,7 +722,7 @@ local function update_cursor(buf)
 	end
 
 	-- focus may have moved to another window showing this buffer
-	sync_window(buf)
+	sync_windows(buf)
 
 	local row = vim.api.nvim_win_get_cursor(0)[1] - 1
 	local conceal_ok = (vim.wo.conceallevel or 0) >= 2
@@ -818,13 +815,15 @@ local function show_hidden(buf)
 	if not module.private.do_render then
 		return
 	end
-	-- image objects are window-bound; re-render them when a window re-enters
-	-- the buffer (mirrors core.latex.renderer's show_hidden).
+	-- image objects are window-bound; re-render every image of every entry
+	-- with fresh geometry when a window re-enters the buffer.
 	for _, entry in pairs(module.private.blocks[buf] or {}) do
-		if entry.shown and entry.image then
-			pcall(function()
-				entry.image:render()
-			end)
+		if entry.shown then
+			for _, img in pairs(entry.images) do
+				pcall(function()
+					img:render({ x = entry.indent, y = entry.anchor_row })
+				end)
+			end
 		end
 	end
 end
@@ -866,7 +865,7 @@ local event_handlers = {
 		end
 	end,
 	["core.autocommands.events.bufwinenter"] = function(event)
-		sync_window(event.buffer)
+		sync_windows(event.buffer)
 		-- First entry into a buffer we have not rendered yet (e.g. BufReadPost
 		-- fired before the module loaded or before ft was set to norg): render
 		-- it now. full_render records state even for block-less buffers, so
@@ -877,7 +876,7 @@ local event_handlers = {
 		show_hidden(event.buffer)
 	end,
 	["core.autocommands.events.winenter"] = function(event)
-		sync_window(event.buffer)
+		sync_windows(event.buffer)
 		show_hidden(event.buffer)
 	end,
 	["core.autocommands.events.cursormoved"] = function(event)

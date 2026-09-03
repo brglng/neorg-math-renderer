@@ -227,9 +227,9 @@ wrapped in `\[ ... \]`.
   lines fall back to blank screen rows.
 - When the cursor moves onto a block's line, that block's image is hidden and
   the raw source revealed; leaving the block restores the image.
-- If the same buffer is displayed in multiple windows, only the focused
-  window renders the images; switching focus rebinds them to the window the
-  cursor moved into.
+- If the same buffer is displayed in multiple windows, every window gets
+  its own rendered images (new splits pick them up automatically, closed
+  windows drop theirs).
 - With `conceal_math_tags = true`, the `@math` / `@end` lines are hidden
   entirely (Neovim >= 0.11 uses whole-row `conceal_lines` hiding).
 - Images wiped by floating UI recover automatically: command line float
