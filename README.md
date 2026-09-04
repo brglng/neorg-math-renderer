@@ -61,7 +61,12 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim):
   config = function()
     require("neorg").setup({
       load = {
-        ["core.defaults"] = {},
+        ["core.defaults"] = {
+          config = {
+            -- Avoid duplicate inline images and conceal extmarks.
+            disable = { "core.latex.renderer" },
+          },
+        },
         ["external.math-renderer"] = {
           config = {
             -- all defaults; see Configuration below
