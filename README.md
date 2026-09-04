@@ -157,8 +157,7 @@ foreground for `foreground_color` and transparent for `background_color`. A
 string beginning with `#` is used as a literal color. Any other string is
 resolved as a highlight-group name; its `fg` or `bg` attribute is used. A
 missing foreground falls back to `Normal`'s foreground; a missing background
-falls back to transparent. The literal string `"transparent"` is not a special value;
-use `nil` for transparent background.
+falls back to transparent.
 
 ## Backend configuration
 
