@@ -1685,10 +1685,10 @@ local function show_inline_entry(buf, entry)
 end
 
 --- Full refresh of `buf`: recreate every shown image from its cached PNG.
---- Used after floating UI (command-line or notification popups) wiped the
+--- Used after floating UI (e.g. notification or Noice popups) wipes the
 --- terminal cells: recreating bypasses any stale render state a plain
 --- re-render might hit. Deferred so the UI finishes its own teardown first,
---- and retried while a command-line UI is still active.
+--- and retried if another command-line UI is still active.
 local function deep_redraw(buf)
 	vim.defer_fn(function()
 		if not module.private.do_render or not vim.api.nvim_buf_is_valid(buf) then
@@ -1703,6 +1703,12 @@ local function deep_redraw(buf)
 			if entry.shown and entry.png then
 				clear_image(entry)
 				ensure_entry_images(buf, entry)
+				-- `ensure_entry_images` reuses existing objects, so explicitly
+				-- render every block image after clearing its backend state.
+				update_reservation(buf, entry)
+				for win, img in pairs(entry.images) do
+					render_entry_image(buf, entry, win, img)
+				end
 			end
 		end
 		local inline_state = module.private.inlines[buf] or {}
@@ -1718,6 +1724,30 @@ local function deep_redraw(buf)
 			end
 		end
 	end, 100)
+end
+
+--- Schedule refresh for every tracked norg buffer visible in a window.
+--- Float-close events can leave a different buffer active, so refreshing only
+--- `nvim_get_current_buf()` can leave images in another visible split stale.
+local function redraw_visible_buffers()
+	local buffers = {}
+	local function collect(state)
+		for buf in pairs(state) do
+			if
+				vim.api.nvim_buf_is_valid(buf)
+				and vim.bo[buf].ft == "norg"
+				and #vim.fn.win_findbuf(buf) > 0
+			then
+				buffers[buf] = true
+			end
+		end
+	end
+
+	collect(module.private.blocks)
+	collect(module.private.inlines)
+	for buf in pairs(buffers) do
+		deep_redraw(buf)
+	end
 end
 
 --- Show `entry`: make sure every window has the image and the row
@@ -2217,26 +2247,13 @@ module.load = function()
 		end,
 	})
 
-	vim.api.nvim_create_autocmd({ "CmdlineLeave", "CmdwinLeave" }, {
-		group = aug,
-		callback = function()
-			local buf = vim.api.nvim_get_current_buf()
-			if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
-				deep_redraw(buf)
-			end
-		end,
-	})
-
-	-- Notification popups and other floating UI wipe images the same way
-	-- when they close; WinClosed fires for every floating window, so this
-	-- stays fully event-driven (no timer).
+	-- Notification, Noice and other floating UI can wipe images when they
+	-- close; WinClosed fires for every window, so this stays fully event-driven
+	-- without command-line-specific hooks or a polling timer.
 	vim.api.nvim_create_autocmd("WinClosed", {
 		group = aug,
 		callback = function()
-			local buf = vim.api.nvim_get_current_buf()
-			if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
-				deep_redraw(buf)
-			end
+			redraw_visible_buffers()
 		end,
 	})
 
@@ -2307,7 +2324,7 @@ module.public = {
 
 	--- Force a full refresh of the current buffer's images. Use when some
 	--- floating UI wiped the terminal cells they were drawn on and no
-	--- WinClosed/CmdlineLeave event fired for it.
+	--- WinClosed event fired for it.
 	redraw = function()
 		if module.private.do_render then
 			deep_redraw(vim.api.nvim_get_current_buf())

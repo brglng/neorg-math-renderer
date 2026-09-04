@@ -287,10 +287,9 @@ wrapped in `\[ ... \]`.
 - If the same buffer is displayed in multiple windows, every window gets
   its own rendered images (new splits pick them up automatically, closed
   windows drop theirs).
-- Images wiped by floating UI recover automatically: command line float
-  (`CmdlineLeave`), any closing window incl. notification popups
-  (`WinClosed`), or a manual `doautocmd User NeorgMathRendererRedraw` /
-  `public.redraw()`.
+- Images wiped by floating UI recover automatically when its window closes
+  (`WinClosed`), including notification and Noice popups, or through a manual
+  `doautocmd User NeorgMathRendererRedraw` / `public.redraw()`.
 - The foreground color tracks `@norg.rendered.latex` (including its link
   target) and is re-resolved on `ColorScheme`, so formulas follow your
   colorscheme automatically.
@@ -324,3 +323,19 @@ verification in a real neorg session.
   inspected or deleted freely.
 - Images bound to a window are re-shown via `BufWinEnter`; if they vanish
   after a window switch, `:Neorg render-math toggle` twice re-renders.
+- **nvim-notify, Noice and overlap clearing**: if `image.nvim` uses
+  `window_overlap_clear_enabled = true`, add `"notify"` and `"noice"` to
+  `window_overlap_clear_ft_ignore`, for example:
+
+  ```lua
+  window_overlap_clear_ft_ignore = {
+    "cmp_menu", "cmp_docs", "", "snacks_notif", "scrollview", "scrollview_sign",
+    "notify", "noice",
+  },
+  ```
+
+  `nvim-notify` uses `notify` as its floating buffer filetype. Without this
+  exception, `image.nvim` intentionally clears math images while a notification
+  overlaps the editor window. A popup still covers pixels beneath it; terminal
+  layering cannot display an image above the popup. Images are refreshed after
+  the popup closes.

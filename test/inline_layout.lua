@@ -12,6 +12,9 @@ local module_source = table.concat(vim.fn.readfile(module_path), "\n")
 local inline_start = assert(module_source:find("create_inline_image = function", 1, true))
 local inline_end = assert(module_source:find("local function ensure_inline_images", inline_start, true))
 local inline_source = module_source:sub(inline_start, inline_end - 1)
+local redraw_start = assert(module_source:find("local function deep_redraw", 1, true))
+local redraw_end = assert(module_source:find("--- Show `entry`", redraw_start, true))
+local redraw_source = module_source:sub(redraw_start, redraw_end - 1)
 
 local failed = false
 local function check(name, condition)
@@ -59,6 +62,18 @@ check("color config uses Normal fallback", module_source:find('highlight_color("
 check("render guards stale buffer positions", module_source:find("buffer_position_valid", 1, true) ~= nil)
 check("deferred image renders are guarded", module_source:find("guard_image_render", 1, true) ~= nil)
 check("insert edits clear stale images", module_source:find("events.textchangedi", 1, true) ~= nil)
+check("floating redraw renders block images", redraw_source:find("update_reservation(buf, entry)", 1, true) ~= nil
+	and redraw_source:find("render_entry_image(buf, entry, win, img)", 1, true) ~= nil)
+local redraw_definition = module_source:find("local function redraw_visible_buffers", 1, true)
+local redraw_definition_end = redraw_definition and module_source:find("\n", redraw_definition, true)
+local first_redraw_handler = redraw_definition_end
+	and module_source:find("redraw_visible_buffers()", redraw_definition_end + 1, true)
+check("floating redraw covers visible split buffers", redraw_definition ~= nil
+	and module_source:find("#vim.fn.win_findbuf(buf) > 0", redraw_definition, true) ~= nil
+	and first_redraw_handler ~= nil)
+check("floating redraw uses window-close hook", module_source:find('nvim_create_autocmd("WinClosed"', 1, true) ~= nil
+	and module_source:find('nvim_create_autocmd({ "CmdlineLeave"', 1, true) == nil
+	and module_source:find('nvim_create_autocmd("CmdlineEnter"', 1, true) == nil)
 
 -- Production letterboxes every inline formula: scale by one proportional
 -- factor, round the terminal-cell box UP to whole cells, then pad the PNG to
