@@ -25,8 +25,8 @@ local uv = vim.uv or vim.loop
 ---@field tex2svg string|function executable name, or a full custom invocation
 ---@field latex string|function executable name, or a full custom invocation
 ---@field dpi number dvipng density for the latex backend
----@field foreground_hex string|nil foreground color as "#rrggbb" (nil = black)
----@field background_color string "transparent" or "#rrggbb"
+---@field foreground_hex string|nil resolved foreground color as "#rrggbb"
+---@field background_color string resolved "transparent" or "#rrggbb"
 ---@field on_error fun(backend: string, msg: string)|nil error reporter hook
 
 --- Default executable names for the built-in backend pipelines.
@@ -57,8 +57,8 @@ M.backends = { "ratex", "tex2svg", "latex" }
 local inflight = {}
 
 --- Apply user/backend configuration. Safe to call again (e.g. on colorscheme
---- change) -- the foreground color is part of the cache key, so cached images
---- are invalidated automatically.
+--- change) -- resolved colors are part of the cache key, so cached images are
+--- invalidated automatically.
 ---@param o neorg-math-renderer.BackendOpts
 function M.setup(o)
 	opts = vim.tbl_deep_extend("force", opts, o or {})
@@ -465,9 +465,9 @@ local converters = {
 	latex = render_latex,
 }
 
--- Bump when generated PNG semantics change. This invalidates old files
--- generated with the pre-normalized dvipng RGB arguments.
-local CACHE_VERSION = "v3-inline-math"
+-- Bump when generated PNG semantics or color resolution changes. This
+-- invalidates old files generated before background color joined the key.
+local CACHE_VERSION = "v4-inline-colors"
 
 --------------------------------------------------------------------------------
 -- public conversion API with disk cache
@@ -479,7 +479,19 @@ local CACHE_VERSION = "v3-inline-math"
 ---@return string cache key
 local function cache_key(snippet, backend, render_opts)
 	local mode = render_opts and render_opts.inline == true and "inline" or "block"
-	return vim.fn.sha256(CACHE_VERSION .. "\0" .. backend .. "\0" .. mode .. "\0" .. M.foreground_hex() .. "\0" .. snippet)
+	return vim.fn.sha256(
+		CACHE_VERSION
+			.. "\0"
+			.. backend
+			.. "\0"
+			.. mode
+			.. "\0"
+			.. M.foreground_hex()
+			.. "\0"
+			.. M.background()
+			.. "\0"
+			.. snippet
+	)
 end
 
 ---@param key string

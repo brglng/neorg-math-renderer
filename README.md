@@ -22,15 +22,15 @@ conceal extmarks.
      `core.latex.renderer`)
 - **Inline height-aware scaling**: `scale` sets maximum inline-image height
   in terminal cell rows. Inline images exceeding cap are downscaled
-  proportionally; smaller images are never enlarged. For visible suffix text,
-  complete-line inline layout may require proportional width/height reduction;
-  with no safe width, image is hidden rather than covering suffix text. A
-  line-end formula does not spend its width on raw source bytes: source is
-  concealed without a replacement placeholder, and image width is capped only
-  by terminal edge when needed. Block sizing remains controlled by `fit_window`.
-- **`core.latex.renderer`-compatible options**: `conceal`, `dpi`,
-  `render_on_enter`, `renderer`, `debounce_ms`, and `scale` (except
-  `min_length`, which is intentionally unsupported).
+  proportionally; smaller images are never enlarged. The scaled PNG is then
+  letterboxed into a ceil-cell box, with padding centered vertically and
+  horizontally, so no image stretch occurs. For visible suffix text, the
+  height-compliant box must fit complete-line inline layout; with no safe width,
+  source stays visible and image is hidden. Block sizing remains controlled by
+  `fit_window`.
+- **`core.latex.renderer`-aligned options**: `conceal`, `dpi`,
+  `render_on_enter`, `debounce_ms`, and `scale` (except `min_length`, which is
+  intentionally unsupported).
 - **Visible block source, concealed inline source**: block images render on
   reserved virtual lines directly below (default) or above the block
   (`position` option). Inline images hide whenever their source row is folded.
@@ -44,6 +44,7 @@ conceal extmarks.
 - [neorg](https://github.com/nvim-neorg/neorg)
 - [image.nvim](https://github.com/3rd/image.nvim) with a working backend
   (kitty/sixel/ueberzug) for your terminal
+- ImageMagick `magick` or `convert` for inline letterboxing
 - At least one LaTeX backend (see below)
 
 ## Install
@@ -118,13 +119,10 @@ All options (defaults shown):
     -- dvipng density for the traditional `latex` backend.
     dpi = 350,
 
-    -- Renderer name accepted for core.latex.renderer compatibility. This
-    -- module uses image.nvim directly for block reservations.
-    renderer = "core.integrations.image",
-
     -- Maximum inline-image height in terminal cell rows. Inline images above
     -- this limit are downscaled proportionally; smaller images are never
-    -- enlarged. Math block sizing is controlled by fit_window.
+    -- enlarged. The result is letterboxed into a ceil-cell box. Math block
+    -- sizing is controlled by fit_window.
     scale = 1,
 
     -- false: block images render at native pixel size, never scaled.
@@ -132,13 +130,15 @@ All options (defaults shown):
     -- This option does not affect inline images.
     fit_window = true,
 
-    -- Foreground color as "#rrggbb". nil = foreground of
-    -- `@neorg.rendered.latex` (following its link, so it tracks your
-    -- colorscheme; fallback: 50% grey, matching core.latex.renderer).
+    -- Foreground color: nil = current `@neorg.rendered.latex` foreground;
+    -- a value starting with # is a literal color; any other string is a
+    -- highlight group name. Missing groups fall back to `Normal`'s foreground.
     foreground_color = nil,
 
-    -- Background of rendered formulas: "transparent" or "#rrggbb".
-    background_color = "transparent",
+    -- Background color: nil = transparent; a value starting with # is a
+    -- literal color; any other string is a highlight group name. A group
+    -- without a background falls back to transparent.
+    background_color = nil,
 
     -- PNG cache directory.
     cache_dir = vim.fn.stdpath("cache") .. "/nvim/neorg-math-renderer",
@@ -151,6 +151,14 @@ All options (defaults shown):
   },
 },
 ```
+
+Color options use three forms. `nil` selects the current default formula
+foreground for `foreground_color` and transparent for `background_color`. A
+string beginning with `#` is used as a literal color. Any other string is
+resolved as a highlight-group name; its `fg` or `bg` attribute is used. A
+missing foreground falls back to `Normal`'s foreground; a missing background
+falls back to transparent. The literal string `"transparent"` is not a special value;
+use `nil` for transparent background.
 
 ## Backend configuration
 
@@ -258,16 +266,19 @@ wrapped in `\[ ... \]`.
   remains visible. A non-whitespace suffix (including following inline nodes)
   uses inline replacement text only when complete raw/display line plus
   placeholders fits actual window width; one cell of slack avoids edge
-  wrapping. If needed, image width and height are reduced together to
-  preserve aspect ratio. If no positive safe width remains, source stays
-  visible and image is hidden. A line-end formula uses conceal without
-  replacement text and normal height-capped sizing, bounded only by terminal
-  edge when needed. Inline images never use image.nvim virtual-line padding or
-  reserve vertical rows.
+  wrapping. If the height-compliant box does not fit safe width, source stays
+  visible and image is hidden rather than applying another scale factor. A
+  line-end formula uses conceal without replacement text and normal
+  height-capped sizing when its box fits the terminal edge; otherwise source
+  stays visible. Inline images are proportionally resized and letterboxed into
+  ceil-cell boxes with vertical and horizontal centering. They never use
+  image.nvim virtual-line padding or reserve vertical rows.
 - `scale` is a maximum inline-image height in terminal cell rows. Only inline
   images taller than that limit are reduced; shorter images keep native size.
-  Width follows original aspect ratio. When line fitting needs more reduction,
-  width and height are reduced together; block images keep their previous
+  The reduced PNG keeps its aspect ratio and is padded to the ceil-cell box;
+  padding uses `background_color` and is centered around the formula in both
+  directions. A height-compliant box that cannot fit line layout is
+  hidden instead of being reduced again; block images keep their previous
   native/`fit_window` sizing behavior.
 - Inline images are always hidden while their source row is inside a closed
   fold. They are not moved outside folds like block images.

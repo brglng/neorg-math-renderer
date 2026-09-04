@@ -20,8 +20,10 @@ concealed according to `conceal`; inline images never reserve virtual lines
 and hide whenever their source row is folded. Inline replacement text is used
 only for formulas with visible suffix/layout nodes, and only when complete
 raw/display line budgeting is safe. End-of-line formulas conceal source
-without replacement text and keep normal height-capped aspect-ratio sizing,
-subject only to a terminal-edge bound when needed.
+without replacement text and keep normal height-capped aspect-ratio sizing
+when it fits the terminal edge; otherwise source stays visible. When an inline
+image is shown, its source is proportionally resized and letterboxed into a
+ceil-cell box: padding is centered vertically and horizontally.
 
 Image backends are probed in the configured `backends` preference order:
 
@@ -31,6 +33,7 @@ Image backends are probed in the configured `backends` preference order:
 
 Requires:
 - The [image.nvim](https://github.com/3rd/image.nvim) neovim plugin.
+- `magick` or `convert` for inline letterboxing.
 - At least one of the LaTeX backends above.
 --]]
 
@@ -84,18 +87,13 @@ module.config.public = {
 	-- Dots per inch used by dvipng for the traditional `latex` backend.
 	dpi = 350,
 
-	-- Renderer name retained for core.latex.renderer configuration
-	-- compatibility. This module always uses image.nvim directly because block
-	-- reservations need its low-level image object.
-	renderer = "core.integrations.image",
-
 	-- Maximum inline-image height in terminal cell rows, expressed as a
 	-- multiple of one terminal line. Inline images above this limit are
 	-- downscaled proportionally; smaller images are never enlarged. For a
-	-- visible suffix, additional proportional width / height reduction may be
-	-- needed to keep complete-line inline layout from wrapping; with no safe
-	-- width the image is hidden. End-of-line formulas do not use that raw-line
-	-- leftover budget. Math block sizing remains controlled by `fit_window`.
+	-- visible suffix, the height-compliant image must fit the complete-line
+	-- budget; with no safe width, source stays visible and the image is hidden.
+	-- End-of-line formulas do not use that raw-line leftover budget. Math block
+	-- sizing remains controlled by `fit_window`.
 	scale = 1,
 
 	-- When false, block images render at native pixel size. When true
@@ -104,13 +102,15 @@ module.config.public = {
 	-- images.
 	fit_window = true,
 
-	-- Foreground color of rendered formulas as "#rrggbb". When nil, the
-	-- foreground of `@neorg.rendered.latex` is used (falling back to 50%
-	-- grey), matching core.latex.renderer.
+	-- Foreground color: nil uses the current `@neorg.rendered.latex`
+	-- foreground; a value starting with # is a literal color; any other
+	-- string names a highlight group whose foreground is used.
 	foreground_color = nil,
 
-	-- Background of rendered formulas: "transparent" (default) or "#rrggbb".
-	background_color = "transparent",
+	-- Background color: nil means transparent; a value starting with # is a
+	-- literal color; any other string names a highlight group whose background
+	-- is used. Missing highlight backgrounds fall back to transparent.
+	background_color = nil,
 
 	-- Directory for cached PNG files (one file per unique formula).
 	cache_dir = vim.fn.stdpath("cache") .. "/nvim/neorg-math-renderer",
@@ -154,22 +154,58 @@ module.private = {
 
 	--- Last time an error was notified per backend (throttle).
 	last_error_notify = {},
+
+	--- Resolved colors passed to backends and used by inline padding.
+	foreground_color = nil,
+	background_color = "transparent",
 }
 
---- Recompute the formula foreground from the active colorscheme. Mirrors
---- core.latex.renderer: read `@neorg.rendered.latex` (the editor resolves
---- its link for us) and fall back to 50% grey when the group has no
---- definition. An explicit `foreground_color` config always wins.
-local function compute_foreground()
-	local hex = module.config.public.foreground_color
-	if not hex then
-		local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = "@neorg.rendered.latex", link = false })
-		if ok and type(hl) == "table" and not vim.tbl_isempty(hl) and hl.fg then
-			hex = ("#%06x"):format(hl.fg)
-		else
-			hex = "#808080" -- 50% grey, same fallback core.latex.renderer uses
-		end
+local function highlight_color(group, attribute)
+	local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+	if ok and type(hl) == "table" and hl[attribute] then
+		return ("#%06x"):format(hl[attribute])
 	end
+	return nil
+end
+
+local function resolve_foreground()
+	local configured = module.config.public.foreground_color
+	if configured == nil then
+		return highlight_color("@neorg.rendered.latex", "fg")
+			or highlight_color("Normal", "fg")
+	end
+	if type(configured) == "string" and configured:sub(1, 1) == "#" then
+		return configured
+	end
+	if type(configured) == "string" then
+		return highlight_color(configured, "fg")
+			or highlight_color("Normal", "fg")
+	end
+	return highlight_color("Normal", "fg")
+end
+
+local function resolve_background()
+	local configured = module.config.public.background_color
+	if configured == nil then
+		return "transparent"
+	end
+	if type(configured) == "string" and configured:sub(1, 1) == "#" then
+		return configured
+	end
+	if type(configured) == "string" then
+		return highlight_color(configured, "bg") or "transparent"
+	end
+	return "transparent"
+end
+
+--- Recompute formula colors from the active colorscheme. Foreground nil uses
+--- `@neorg.rendered.latex`, then `Normal`; background nil is transparent. A #
+--- value is a literal color, while any other string is resolved as a highlight group.
+local function compute_foreground()
+	local foreground = resolve_foreground()
+	local background = resolve_background()
+	module.private.foreground_color = foreground
+	module.private.background_color = background
 
 	backends.setup({
 		cache_dir = module.config.public.cache_dir,
@@ -177,8 +213,8 @@ local function compute_foreground()
 		tex2svg = module.config.public.tex2svg,
 		latex = module.config.public.latex,
 		dpi = module.config.public.dpi,
-		foreground_hex = hex,
-		background_color = module.config.public.background_color,
+		foreground_hex = foreground,
+		background_color = background,
 		on_error = function(backend, msg)
 			module.private.report_error(backend, msg)
 		end,
@@ -299,6 +335,12 @@ local function get_inline_math(buf)
 				range = range,
 				snippet = clean_inline_snippet(original),
 				png = nil,
+				box_png = nil,
+				box_geometry = nil,
+				box_key = nil,
+				box_pending = false,
+				box_generation = 0,
+				box_unavailable = false,
 				images = {},
 				extmark_id = nil,
 				shown = false,
@@ -330,37 +372,19 @@ local function scale_limit()
 	return nil
 end
 
---- Return native height capped by `scale`, in terminal cell rows. Explicitly
---- setting native height even below the cap prevents image.nvim's global
---- `scale_factor` from enlarging short formulas.
-local function image_height_limit(img)
-	local cap = scale_limit()
+--- Compute inline geometry from source pixel dimensions: apply one
+--- proportional factor (the `scale` height cap, or native size when the
+--- formula already fits), round the scaled pixels, then ceil the terminal
+--- cell box. The formula is later letterboxed into this box, so padding—not
+--- a second resize—absorbs the cell rounding.
+---@return table|nil geometry with scaled_width, scaled_height, width_cells,
+--- height_rows, width_pixels, height_pixels, and factor
+local function inline_box_geometry_from_size(width, height)
 	local ok_term, term = pcall(function()
-		return require("image.utils.term").get_size()
+		return require("image/utils/term").get_size()
 	end)
-	local px = img and tonumber(img.image_height)
-	if not ok_term or not term or not term.cell_height or term.cell_height <= 0 or not px or px <= 0 then
-		return nil
-	end
-	local native_rows = px / term.cell_height
-	return cap and math.min(native_rows, cap) or native_rows
-end
-
---- Return scaled display dimensions in terminal cells for inline images.
---- `max_width` is an optional complete-line layout budget. When it is
---- smaller than the height-capped image, reduce both dimensions by the same
---- factor; this keeps the image's aspect ratio and never upscales it.
---- The third return value is exact height in terminal rows for image.nvim's
---- geometry; the second is its rounded screen-cell height.
-local function image_display_dimensions(img, max_width)
-	if max_width and max_width <= 0 then
-		return 0, 0, 0
-	end
-	local ok_term, term = pcall(function()
-		return require("image.utils.term").get_size()
-	end)
-	local width = img and tonumber(img.image_width)
-	local height = img and tonumber(img.image_height)
+	width = tonumber(width)
+	height = tonumber(height)
 	if
 		not ok_term
 		or not term
@@ -373,7 +397,7 @@ local function image_display_dimensions(img, max_width)
 		or width <= 0
 		or height <= 0
 	then
-		return 1, 1, 1
+		return nil
 	end
 
 	local factor = 1
@@ -382,35 +406,45 @@ local function image_display_dimensions(img, max_width)
 	if cap and native_rows > cap then
 		factor = cap / native_rows
 	end
-	local height_factor = factor
-	local width_factor
-	if max_width then
-		-- Inline virtual text must fit the complete raw/display line. A width
-		-- cap therefore downscales height too instead of clipping or overlaying
-		-- the suffix after the formula.
-		width_factor = max_width * term.cell_width / width
-		factor = math.min(factor, width_factor)
-	end
-
-	local display_width = math.max(1, math.floor(width * factor / term.cell_width))
-	if max_width then
-		display_width = math.min(display_width, max_width)
-	end
-	local exact_height = native_rows * factor
-	if width_factor and width_factor <= height_factor then
-		-- image.nvim rounds one dimension up while restoring aspect ratio. Make
-		-- horizontal fitting infinitesimally narrower so that rounding cannot
-		-- turn a width budget of N cells into N+1 painted cells.
-		exact_height = (display_width * term.cell_width / (width / height)) / term.cell_height * (1 - 1e-9)
-	end
-	return display_width, math.max(1, math.ceil(exact_height)), exact_height
+	local scaled_width = math.max(1, math.floor(width * factor + 0.5))
+	local scaled_height = math.max(1, math.floor(height * factor + 0.5))
+	local width_cells = math.max(1, math.ceil(scaled_width / term.cell_width))
+	local height_rows = math.max(1, math.ceil(scaled_height / term.cell_height))
+	return {
+		scaled_width = scaled_width,
+		scaled_height = scaled_height,
+		width_cells = width_cells,
+		height_rows = height_rows,
+		width_pixels = width_cells * term.cell_width,
+		height_pixels = height_rows * term.cell_height,
+		factor = factor,
+	}
 end
 
---- Apply current scale to an image. Resetting height on every render also
---- handles runtime config changes and prevents accidental upscaling.
-local function apply_image_height_limit(img)
-	if img and img.geometry then
-		img.geometry.height = image_height_limit(img)
+local function inline_box_geometry(img)
+	return inline_box_geometry_from_size(img and img.image_width, img and img.image_height)
+end
+
+--- Placeholder/geometry size in terminal cells for inline images, from the
+--- ceil box above. `max_width` is an optional complete-line layout budget;
+--- when the box cannot fit, the first return is zero so callers leave the
+--- source visible instead of distorting the image. The remaining returns are
+--- the box height in rows and the scaled formula size in pixels.
+local function image_display_dimensions(img, max_width)
+	local geometry = inline_box_geometry(img)
+	if not geometry then
+		return 0, 0, 0, 0
+	end
+	if max_width and geometry.width_cells > max_width then
+		return 0, 0, 0, 0
+	end
+	return geometry.width_cells, geometry.height_rows, geometry.scaled_width, geometry.scaled_height
+end
+
+local function apply_inline_box_geometry(img, geometry)
+	if img and img.geometry and geometry then
+		img.geometry.width = geometry.width_cells
+		img.geometry.height = geometry.height_rows
 	end
 end
 
@@ -426,7 +460,7 @@ local function image_rows(img)
 		return math.max(1, math.floor(rendered))
 	end
 	local ok_term, term = pcall(function()
-		return require("image.utils.term").get_size()
+		return require("image/utils/term").get_size()
 	end)
 	local ok_px, px = pcall(function()
 		return img.image_height
@@ -907,6 +941,8 @@ local reposition_pending = {}
 local reposition_preferred = {}
 local clear_stale_entries
 local render_inline_state
+local create_inline_image
+local render_inline_entry
 
 --- Re-render every image in `buf` on the next scheduler tick. Fold changes,
 --- virtual-line reservation moves and other viewport layout changes can move
@@ -1114,7 +1150,11 @@ local function inline_other_placeholder_width(buf, entry)
 				image = candidate
 				break
 			end
-			if image then
+			if other.box_geometry then
+				total = total + other.box_geometry.width_cells
+			elseif image then
+				-- Box geometry is normally populated before this function runs;
+				-- use raw dimensions only while a cache entry is being initialized.
 				total = total + image_display_dimensions(image)
 			end
 		end
@@ -1153,7 +1193,7 @@ end
 --- with visible suffix/layout nodes gets inline replacement text only when
 --- complete-line budgeting leaves safe room. A line-end formula gets conceal
 --- without replacement text, so its image does not inherit raw-line width.
-local function update_inline_extmark(buf, entry, image)
+local function update_inline_extmark(buf, entry, box)
 	local range = entry.range
 	local suffix_width, following_nodes = inline_suffix_width(buf, entry)
 	local suffix_present = suffix_width > 0 or following_nodes > 0
@@ -1183,12 +1223,17 @@ local function update_inline_extmark(buf, entry, image)
 	}
 
 	if not on_cursor_row then
+		local width = box and box.width_cells or 0
+		if max_width and width > max_width then
+			width = 0
+		end
+		if width <= 0 then
+			-- A width-constrained image cannot be made smaller without applying
+			-- another scale factor. Keep source visible as a safe fallback.
+			clear_inline_extmark(buf, entry)
+			return on_cursor_row, conceal_enabled, 0, suffix_present
+		end
 		if suffix_present then
-			local width = image_display_dimensions(image, max_width)
-			if width <= 0 then
-				clear_inline_extmark(buf, entry)
-				return on_cursor_row, conceal_enabled, 0, suffix_present
-			end
 			ext_opts.virt_text = { { string.rep(" ", width), "" } }
 			ext_opts.virt_text_pos = "inline"
 		end
@@ -1220,8 +1265,150 @@ local function inline_is_folded(entry, win)
 	return ok and folded or false
 end
 
-local function render_inline_entry(buf, entry)
+--- Read PNG pixel dimensions from the IHDR chunk without any external
+--- tool. Returns nil for non-PNG or unreadable files.
+local function png_dimensions(path)
+	local uv = vim.uv or vim.loop
+	local ok, fd = pcall(uv.fs_open, path, "r", 438)
+	if not ok or not fd then
+		return nil
+	end
+	local ok_data, data = pcall(uv.fs_read, fd, 24, 0)
+	pcall(uv.fs_close, fd)
+	if not ok_data or type(data) ~= "string" or #data < 24 then
+		return nil
+	end
+	local sig = string.char(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+	if data:sub(1, 8) ~= sig then
+		return nil
+	end
+	-- Bytes 8..15 are the IHDR chunk header; width is at 16..19 and height at
+	-- 20..23, both big-endian.
+	local w = data:byte(17) * 16777216 + data:byte(18) * 65536 + data:byte(19) * 256 + data:byte(20)
+	local h = data:byte(21) * 16777216 + data:byte(22) * 65536 + data:byte(23) * 256 + data:byte(24)
+	if w <= 0 or h <= 0 then
+		return nil
+	end
+	return w, h
+end
+
+local function magick_binary()
+	if vim.fn.executable("magick") == 1 then
+		return "magick"
+	elseif vim.fn.executable("convert") == 1 then
+		return "convert"
+	end
+	return nil
+end
+
+--- Letterbox one formula PNG into its ceil-cell box: scale proportionally by
+--- the single `scale` factor, then pad to the exact box size with the
+--- resolved background (transparent or a configured color).
+--- Padding is centered vertically and horizontally. The result matches the box geometry
+--- pixel-for-pixel, so image.nvim applies no transform of its own and the
+--- formula is never stretched. Results are cached under `<cache_dir>/pad/`.
+local function ensure_inline_box_png(buf, entry)
 	if not entry.png then
+		return
+	end
+
+	local source_png = entry.png
+	local native_w, native_h = png_dimensions(source_png)
+	local geometry = native_w and native_h and inline_box_geometry_from_size(native_w, native_h) or nil
+	entry.box_geometry = geometry
+	if not geometry then
+		entry.box_png = nil
+		entry.box_key = nil
+		entry.box_pending = nil
+		return
+	end
+
+	local bg = module.private.background_color or "transparent"
+	local mtime = vim.fn.getftime(source_png)
+	local key = vim.fn.sha256(
+		("inline-letterbox-v1|%s|%d|%d|%d|%d|%s"):format(
+			source_png,
+			mtime,
+			geometry.scaled_width,
+			geometry.scaled_height,
+			geometry.width_pixels,
+			geometry.height_pixels,
+			tostring(bg)
+		)
+	)
+	local pad_dir = module.config.public.cache_dir .. "/pad"
+	local out = pad_dir .. "/" .. key .. ".png"
+
+	if entry.box_key == key then
+		if entry.box_pending or entry.box_unavailable then
+			return
+		end
+		if entry.box_png and vim.fn.filereadable(entry.box_png) == 1 then
+			return
+		end
+		entry.box_key = nil
+	end
+	if entry.box_pending then
+		return
+	end
+	if vim.fn.filereadable(out) == 1 then
+		entry.box_png = out
+		entry.box_key = key
+		entry.box_unavailable = false
+		return
+	end
+
+	local magick = magick_binary()
+	if not magick then
+		entry.box_png = nil
+		entry.box_key = key
+		entry.box_unavailable = true
+		module.private.report_error("magick", "inline letterboxing requires magick or convert")
+		return
+	end
+
+	entry.box_png = nil
+	entry.box_key = key
+	entry.box_unavailable = false
+	entry.box_pending = true
+	entry.box_generation = (entry.box_generation or 0) + 1
+	local generation = entry.box_generation
+	vim.fn.mkdir(pad_dir, "p")
+	local background = bg == "transparent" and "none" or tostring(bg)
+	vim.system({
+		magick,
+		source_png,
+		"-resize", ("%dx%d"):format(geometry.scaled_width, geometry.scaled_height),
+		"-background", background,
+		"-gravity", "Center",
+		"-extent", ("%dx%d"):format(geometry.width_pixels, geometry.height_pixels),
+		out,
+	}, { text = true }, function(res)
+		vim.schedule(function()
+			if entry.box_generation ~= generation or entry.png ~= source_png then
+				return
+			end
+			entry.box_pending = nil
+			if res.code ~= 0 or vim.fn.filereadable(out) ~= 1 then
+				entry.box_unavailable = true
+				module.private.report_error("magick", ("letterbox failed (%d)"):format(res.code))
+				return
+			end
+			entry.box_png = out
+			entry.box_unavailable = false
+			if vim.api.nvim_buf_is_valid(buf) and module.private.do_render then
+				-- Recreate window images from the padded PNG and lay them out.
+				clear_image(entry)
+				render_inline_state(buf)
+			end
+		end)
+	end)
+end
+
+render_inline_entry = function(buf, entry)
+	if not entry.png or not entry.box_png or not entry.box_geometry then
+		clear_image(entry)
+		clear_inline_extmark(buf, entry)
 		return
 	end
 	if not buffer_range_valid(buf, entry.range) then
@@ -1238,7 +1425,12 @@ local function render_inline_entry(buf, entry)
 		clear_inline_extmark(buf, entry)
 		return
 	end
-	local on_cursor_row, conceal_enabled, concealed_width, suffix_present = update_inline_extmark(buf, entry, first_image)
+	local box = entry.box_geometry
+	if not box then
+		clear_inline_extmark(buf, entry)
+		return
+	end
+	local on_cursor_row, conceal_enabled, concealed_width, suffix_present = update_inline_extmark(buf, entry, box)
 	local width_limit = concealed_width
 	if not conceal_enabled then
 		-- Without active conceal the source remains in normal layout. Keep the
@@ -1258,8 +1450,8 @@ local function render_inline_entry(buf, entry)
 			or (module.config.public.conceal and on_cursor_row and conceal_enabled)
 			or no_conceal_room
 		if not hidden then
-			local width = image_display_dimensions(image, width_limit)
-			if width <= 0 then
+			local width = box.width_cells
+			if width_limit and width > width_limit then
 				hidden = true
 			end
 		end
@@ -1272,11 +1464,14 @@ local function render_inline_entry(buf, entry)
 			image.hidden_by_inline = true
 		else
 			image.hidden_by_inline = false
-			local width, _, exact_height = image_display_dimensions(image, width_limit)
-			image.geometry.width = width
-			-- Keep horizontal fitting proportional: lowering width also lowers
-			-- geometry height, while the `scale` cap remains a maximum only.
-			image.geometry.height = exact_height
+			-- Keep external image.nvim limits from changing the box size
+			-- independently of this module's scale policy.
+			image.ignore_global_max_size = true
+			-- The PNG (letterboxed by this module) already matches the ceil-cell
+			-- box pixel-for-pixel, so image.nvim applies no transform and no
+			-- second scale factor can distort the formula.
+			image.geometry.width = box.width_cells
+			image.geometry.height = box.height_rows
 			image.buffer = buf
 			image.window = win
 			image.inline = true
@@ -1288,13 +1483,18 @@ local function render_inline_entry(buf, entry)
 	end
 end
 
-local function create_inline_image(buf, entry, win)
-	if not module.private.image or not entry.png or entry.images[win] then
+create_inline_image = function(buf, entry, win)
+	-- Only use the letterboxed PNG. It matches the ceil-cell geometry
+	-- pixel-for-pixel, so image.nvim performs no transform and the formula is
+	-- never stretched. While padding is unavailable or in flight, source text
+	-- remains visible and no image is created.
+	local png = entry.box_png
+	if not module.private.image or not png or not entry.box_geometry or entry.images[win] then
 		return
 	end
 
 	local range = entry.range
-	local ok, image = pcall(module.private.image.from_file, entry.png, {
+	local ok, image = pcall(module.private.image.from_file, png, {
 		window = win,
 		buffer = buf,
 		inline = true,
@@ -1313,10 +1513,13 @@ local function create_inline_image(buf, entry, win)
 	if ok and image then
 		entry.images[win] = image
 		guard_image_render(buf, image)
-		-- Cloned image.nvim objects may inherit caps from another image.
+		-- Inline scale is this module's only size policy. Ignore image.nvim
+		-- global width/height caps so they cannot introduce a second, non-
+		-- proportional scale factor.
+		image.ignore_global_max_size = true
 		image.max_width_window_percentage = 100000
 		image.max_height_window_percentage = 100000
-		apply_image_height_limit(image)
+		apply_inline_box_geometry(image, entry.box_geometry)
 	end
 end
 
@@ -1329,15 +1532,22 @@ local function ensure_inline_images(buf, entry)
 	-- Keep this check for image objects created before this invariant was
 	-- introduced. Recreate them without virtual padding.
 	local wanted_padding = false
+	local wanted_png = entry.box_png and vim.fn.fnamemodify(entry.box_png, ":p") or nil
 	for win, image in pairs(entry.images) do
-		if not live[win] or image.with_virtual_padding ~= wanted_padding then
+		local image_png = image.original_path and vim.fn.fnamemodify(image.original_path, ":p") or nil
+		if
+			not live[win]
+			or image.with_virtual_padding ~= wanted_padding
+			or not wanted_png
+			or image_png ~= wanted_png
+		then
 			pcall(function()
 				image:clear()
 			end)
 			entry.images[win] = nil
 		end
 	end
-	if entry.shown and entry.png then
+	if entry.shown and entry.png and entry.box_png then
 		for _, win in ipairs(wins) do
 			create_inline_image(buf, entry, win)
 		end
@@ -1352,16 +1562,26 @@ end
 
 render_inline_state = function(buf)
 	local state = module.private.inlines[buf] or {}
+	-- Ensure every formula has its letterboxed box PNG first. While padding is
+	-- pending, keep source text visible and do not create a stretched fallback.
+	for _, entry in pairs(state) do
+		if entry.shown and entry.png then
+			ensure_inline_box_png(buf, entry)
+		end
+	end
 	-- Create every window-scoped image before laying out any extmark. This
 	-- lets each entry account for other placeholders on its raw line, even
 	-- when several formulas share one line.
 	for _, entry in pairs(state) do
-		if entry.shown and entry.png then
+		if entry.shown and entry.png and entry.box_png then
 			ensure_inline_images(buf, entry)
+		elseif entry.shown then
+			clear_image(entry)
+			clear_inline_extmark(buf, entry)
 		end
 	end
 	for _, entry in pairs(state) do
-		if entry.shown and entry.png then
+		if entry.shown and entry.png and entry.box_png then
 			render_inline_entry(buf, entry)
 		end
 	end
@@ -1454,6 +1674,8 @@ local function show_inline_entry(buf, entry)
 			return
 		end
 		entry.png = png
+		entry.box_png = nil
+		entry.box_key = nil
 		-- Lay out all ready inline entries together so multiple formulas on one
 		-- raw line share the same complete-line width budget.
 		render_inline_state(buf)
@@ -1748,6 +1970,12 @@ local function colorscheme_changed()
 				for _, entry in pairs(state) do
 					deactivate_inline_entry(buf, entry)
 					entry.png = nil
+					entry.box_png = nil
+					entry.box_geometry = nil
+					entry.box_key = nil
+					entry.box_pending = nil
+					entry.box_unavailable = false
+					entry.box_generation = (entry.box_generation or 0) + 1
 				end
 				schedule_render(buf, 0)
 			end
@@ -1865,14 +2093,6 @@ module.load = function()
 		module.private.image = image
 	end
 
-	if module.config.public.renderer ~= "core.integrations.image" then
-		vim.notify(
-			"neorg-math-renderer: renderer option is compatibility-only; "
-			.. "image.nvim is used directly for math images",
-			vim.log.levels.WARN
-		)
-	end
-
 	module.private.ns = vim.api.nvim_create_namespace("neorg-math-renderer")
 
 	-- render_on_enter implies rendering starts enabled (mirrors core.latex.renderer).
@@ -1935,6 +2155,33 @@ module.load = function()
 					schedule_reposition(buf, win)
 				end
 			end)
+		end,
+	})
+
+	-- A font or terminal-size change alters the cell dimensions every inline
+	-- box is computed from. Drop the letterboxed PNGs so the next render pads
+	-- for the new cell size (the pad cache is keyed by box size, so stale
+	-- files simply become dead entries).
+	vim.api.nvim_create_autocmd("VimResized", {
+		group = aug,
+		callback = function()
+			for buf, state in pairs(module.private.inlines) do
+				for _, entry in pairs(state) do
+					entry.box_png = nil
+					entry.box_geometry = nil
+					entry.box_key = nil
+					entry.box_pending = nil
+					entry.box_unavailable = false
+					entry.box_generation = (entry.box_generation or 0) + 1
+					clear_image(entry)
+					clear_inline_extmark(buf, entry)
+				end
+			end
+			for buf, state in pairs(module.private.inlines) do
+				if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
+					schedule_render(buf, 0)
+				end
+			end
 		end,
 	})
 

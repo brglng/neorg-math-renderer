@@ -9,7 +9,7 @@
 
 local module_path = "lua/neorg/modules/external/math-renderer/module.lua"
 local module_source = table.concat(vim.fn.readfile(module_path), "\n")
-local inline_start = assert(module_source:find("local function create_inline_image", 1, true))
+local inline_start = assert(module_source:find("create_inline_image = function", 1, true))
 local inline_end = assert(module_source:find("local function ensure_inline_images", inline_start, true))
 local inline_source = module_source:sub(inline_start, inline_end - 1)
 
@@ -26,7 +26,7 @@ end
 check("inline placeholder width is layout-bounded", module_source:find('virt_text_pos%s*=%s*"inline"') ~= nil
 	and module_source:find("inline_raw_line_width", 1, true) ~= nil
 	and module_source:find("nvim_win_get_width", 1, true) ~= nil
-	and module_source:find("exact_height", 1, true) ~= nil
+	and module_source:find("image_display_dimensions", 1, true) ~= nil
 	and module_source:find('virt_text_pos%s*=%s*"overlay"') == nil)
 check("line-end layout bypasses raw-line budget", module_source:find("inline_suffix_width", 1, true) ~= nil
 	and module_source:find("inline_edge_width", 1, true) ~= nil
@@ -34,9 +34,78 @@ check("line-end layout bypasses raw-line budget", module_source:find("inline_suf
 	and module_source:find("End-of-line conceal intentionally has no replacement text", 1, true) ~= nil)
 check("inline image disables virtual padding", inline_source:find("with_virtual_padding%s*=%s*false") ~= nil)
 check("inline image has no virtual-line options", inline_source:find("virt_lines") == nil)
+check("inline geometry uses ceil-cell box", module_source:find("math.ceil(scaled_width / term.cell_width)", 1, true) ~= nil
+	and module_source:find("math.ceil(scaled_height / term.cell_height)", 1, true) ~= nil
+	and module_source:find("image.geometry.width = box.width_cells", 1, true) ~= nil
+	and module_source:find("image.geometry.height = box.height_rows", 1, true) ~= nil)
+check("inline letterbox pads without stretching", module_source:find('"-gravity", "Center"', 1, true) ~= nil
+	and module_source:find('"-extent"', 1, true) ~= nil
+	and module_source:find('"-resize"', 1, true) ~= nil)
+check("letterbox honors background_color", module_source:find('background = bg == "transparent" and "none" or tostring(bg)', 1, true) ~= nil)
+check("PNG signature parser uses 0x1a", module_source:find("0x1a", 1, true) ~= nil
+	and module_source:find("\\032", 1, true) == nil)
+check("letterbox result is cached", module_source:find("/pad", 1, true) ~= nil
+	and module_source:find("ensure_inline_box_png", 1, true) ~= nil
+	and module_source:find("box_key", 1, true) ~= nil)
+check("resize invalidates letterbox cache", module_source:find('create_autocmd("VimResized"', 1, true) ~= nil)
+check("inline ignores global image size caps", module_source:find("image.ignore_global_max_size = true", 1, true) ~= nil)
+check("scale cap uses strict greater comparison", module_source:find("native_rows > cap", 1, true) ~= nil)
+check("width overflow uses safe fallback", module_source:find("return 0, 0, 0, 0", 1, true) ~= nil)
+check("renderer config is removed", module_source:find("renderer%s*=", 1) == nil
+	and module_source:find("compatibility-only", 1, true) == nil)
+check("color config uses Normal fallback", module_source:find('highlight_color("Normal", "fg")', 1, true) ~= nil
+	and module_source:find("#808080", 1, true) == nil
+	and module_source:find("background_color = nil", 1, true) ~= nil)
 check("render guards stale buffer positions", module_source:find("buffer_position_valid", 1, true) ~= nil)
 check("deferred image renders are guarded", module_source:find("guard_image_render", 1, true) ~= nil)
 check("insert edits clear stale images", module_source:find("events.textchangedi", 1, true) ~= nil)
+
+-- Production letterboxes every inline formula: scale by one proportional
+-- factor, round the terminal-cell box UP to whole cells, then pad the PNG to
+-- the exact box (centered vertically and horizontally). The padded
+-- PNG matches the geometry pixel-for-pixel, so image.nvim applies no
+-- transform and no second rounding rule can distort the formula.
+local function inline_box(image_width, image_height, cell_width, cell_height, scale_cap)
+	local native_rows = image_height / cell_height
+	local factor = 1
+	if scale_cap and native_rows > scale_cap then
+		factor = scale_cap / native_rows
+	end
+	local scaled_w = math.max(1, math.floor(image_width * factor + 0.5))
+	local scaled_h = math.max(1, math.floor(image_height * factor + 0.5))
+	local box_w = math.max(1, math.ceil(scaled_w / cell_width))
+	local box_h = math.max(1, math.ceil(scaled_h / cell_height))
+	return scaled_w, scaled_h, box_w, box_h, factor
+end
+
+local image_width, image_height = 1010, 100
+local cell_width, cell_height = 10, 16
+local native_rows = image_height / cell_height
+local scale_cap = 0.5
+local scaled_w, scaled_h, box_w, box_h, factor = inline_box(
+	image_width,
+	image_height,
+	cell_width,
+	cell_height,
+	scale_cap
+)
+local box_pw, box_ph = box_w * cell_width, box_h * cell_height
+local box_aspect = box_pw / box_ph
+local scaled_aspect = scaled_w / scaled_h
+check("box is at least the scaled formula", box_pw >= scaled_w and box_ph >= scaled_h)
+check("box rounds up to whole cells", box_w == math.ceil(scaled_w / cell_width)
+	and box_h == math.ceil(scaled_h / cell_height))
+check("scaled size respects the height cap", scaled_h <= scale_cap * cell_height + 0.5)
+check("scaled size never upscales", scaled_w <= image_width and scaled_h <= image_height)
+check("padding never exceeds one cell per axis", box_pw - scaled_w < cell_width
+	and box_ph - scaled_h < cell_height)
+
+-- Equal-to-cap native height keeps the native factor; a sub-cap formula is
+-- never enlarged.
+local _, _, _, _, native_factor = inline_box(image_width, image_height, cell_width, cell_height, native_rows)
+local _, _, _, _, short_factor = inline_box(image_width, image_height, cell_width, cell_height, native_rows + 1)
+check("height at cap keeps native factor", native_factor == 1)
+check("height below cap keeps native factor", short_factor == 1)
 
 vim.o.lines = 12
 vim.wo.conceallevel = 2

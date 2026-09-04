@@ -27,6 +27,9 @@ A long inline formula must not create a blank screen row or reserve a
 virtual line below it:
     - $|\text{bit} = \text{LFSR} \;\&\; 1, \quad \text{feedback} = \text{popcount}(\text{LFSR} \;\&\; \text{poly}) \bmod 2|$
 
+Scaled inline images occupy a ceil-cell box without stretching: padding is
+centered vertically and horizontally. `background_color` controls that padding.
+
 * Alignment content (bare & and \\)
 
 @math
