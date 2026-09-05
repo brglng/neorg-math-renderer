@@ -91,6 +91,14 @@ In a norg buffer:
 Images appear as soon as backend conversion finishes. Block source stays
 visible; inline source follows `conceal` and remains editable on its cursor row.
 
+The renderer refreshes images after Ctrl-L and common UI lifecycle redraws. For
+plugins that repaint the terminal directly without such an event, trigger the
+manual hook after repainting:
+
+```vim
+doautocmd User NeorgMathRendererRedraw
+```
+
 ## Configuration
 
 All options (defaults shown):

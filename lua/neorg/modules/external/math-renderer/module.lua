@@ -152,6 +152,9 @@ module.private = {
 	--- Per-buffer debounce timer handles.
 	timers = {},
 
+	--- Namespace used by the Ctrl-L redraw key listener.
+	redraw_key_ns = nil,
+
 	--- Last time an error was notified per backend (throttle).
 	last_error_notify = {},
 
@@ -752,6 +755,27 @@ local function screen_position(win, row, col)
 	return position
 end
 
+--- Folded images are rendered with an absolute screen position because their
+--- buffer row is inside a closed fold. Keep their bottom edge inside the
+--- window content area; image.nvim cannot crop detached images to the window
+--- and would otherwise paint over the statusline.
+local function image_fits_window_bottom(win, screen_row, rows)
+	local ok, info = pcall(function()
+		return vim.fn.getwininfo(win)[1]
+	end)
+	if not ok or not info then
+		return false
+	end
+	local winrow = tonumber(info.winrow)
+	local height = tonumber(info.height)
+	if not winrow or not height or type(screen_row) ~= "number" or type(rows) ~= "number" or rows <= 0 then
+		return false
+	end
+	-- `screen_row` is the 1-based row returned by screenpos(), while the
+	-- detached image backend starts at its zero-based y plus one.
+	return screen_row + rows <= winrow + height - 1
+end
+
 --- Render one per-window image with current geometry. image.nvim normally
 --- clears images whose buffer row is inside a fold. A math block image is an
 --- intentional exception: keep it visible at the collapsed block position.
@@ -802,12 +826,13 @@ local function render_entry_image(buf, entry, win, img)
 
 	if placement.folded then
 		local position = screen_position(win, placement.image_row, entry.indent)
-		if not position then
-			-- The folded anchor is outside the viewport. Clear the old
-			-- absolute placement; otherwise it stays painted at its previous
-			-- screen row and overlaps whatever has scrolled into view. Keep
-			-- the image object in entry.images so it can render again when
-			-- the fold returns to the viewport.
+		local image_screen_row = position and position.row + placement.offset
+		if not position or not image_fits_window_bottom(win, image_screen_row, image_rows(img)) then
+			-- The folded anchor is outside the viewport or the image would cross
+			-- the window's bottom edge. Clear the old absolute placement;
+			-- otherwise it stays painted at its previous screen row and overlaps
+			-- whatever has scrolled into view or the statusline. Keep the image
+			-- object in entry.images so it can render again when it fits.
 			pcall(function()
 				img:clear(true)
 			end)
@@ -1685,12 +1710,17 @@ local function show_inline_entry(buf, entry)
 end
 
 --- Full refresh of `buf`: recreate every shown image from its cached PNG.
---- Used after floating UI (e.g. notification or Noice popups) wipes the
---- terminal cells: recreating bypasses any stale render state a plain
---- re-render might hit. Deferred so the UI finishes its own teardown first,
---- and retried if another command-line UI is still active.
+--- Used after any UI event that may wipe terminal cells: recreating bypasses
+--- stale render state a plain re-render might hit. Deferred so the UI finishes
+--- its own teardown first, and retried if another command-line UI is active.
+local deep_redraw_pending = {}
 local function deep_redraw(buf)
+	if deep_redraw_pending[buf] then
+		return
+	end
+	deep_redraw_pending[buf] = true
 	vim.defer_fn(function()
+		deep_redraw_pending[buf] = nil
 		if not module.private.do_render or not vim.api.nvim_buf_is_valid(buf) then
 			return
 		end
@@ -2248,8 +2278,8 @@ module.load = function()
 	})
 
 	-- Notification, Noice and other floating UI can wipe images when they
-	-- close; WinClosed fires for every window, so this stays fully event-driven
-	-- without command-line-specific hooks or a polling timer.
+	-- close; WinClosed fires for every window. Coalesce redraw requests because
+	-- one UI transition can emit several lifecycle events.
 	vim.api.nvim_create_autocmd("WinClosed", {
 		group = aug,
 		callback = function()
@@ -2257,9 +2287,40 @@ module.load = function()
 		end,
 	})
 
+	-- Other non-key UI transitions can repaint the terminal without changing
+	-- the viewport. There is no generic Redraw autocmd, so cover the lifecycle
+	-- events Neovim exposes and leave direct redraws an explicit User hook below.
+	vim.api.nvim_create_autocmd({
+		"CmdlineLeave",
+		"CmdwinLeave",
+		"FocusGained",
+		"VimResume",
+		"UIEnter",
+		"TabEnter",
+	}, {
+		group = aug,
+		callback = function()
+			redraw_visible_buffers()
+		end,
+	})
+
+	-- Ctrl-L forces a terminal repaint without firing viewport autocmds.
+	-- image.nvim's terminal graphics are erased by that repaint, so detect the
+	-- key without replacing its mapping and refresh after it completes.
+	if module.private.redraw_key_ns then
+		vim.on_key(nil, module.private.redraw_key_ns)
+	end
+	module.private.redraw_key_ns = vim.api.nvim_create_namespace("neorg-math-renderer-redraw-key")
+	local ctrl_l = vim.keycode("<C-L>")
+	vim.on_key(function(key, typed)
+		if key == ctrl_l or typed == ctrl_l then
+			redraw_visible_buffers()
+		end
+	end, module.private.redraw_key_ns)
+
 	-- Manual redraw hook: `doautocmd User NeorgMathRendererRedraw` (or
-	-- module.public.redraw()) forces a sweep, e.g. from an autocmd of a
-	-- specific notification plugin.
+	-- module.public.redraw()) forces a sweep for redraws with no lifecycle
+	-- event, e.g. a direct API `redraw!` call from another plugin.
 	vim.api.nvim_create_autocmd("User", {
 		group = aug,
 		pattern = "NeorgMathRendererRedraw",
@@ -2322,12 +2383,11 @@ module.public = {
 		return module.private.backend
 	end,
 
-	--- Force a full refresh of the current buffer's images. Use when some
-	--- floating UI wiped the terminal cells they were drawn on and no
-	--- WinClosed event fired for it.
+	--- Force a full refresh of every visible norg buffer's images. Use when
+	--- external code repaints the terminal without a lifecycle event.
 	redraw = function()
 		if module.private.do_render then
-			deep_redraw(vim.api.nvim_get_current_buf())
+			redraw_visible_buffers()
 		end
 	end,
 }

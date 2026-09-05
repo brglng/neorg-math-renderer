@@ -71,9 +71,27 @@ local first_redraw_handler = redraw_definition_end
 check("floating redraw covers visible split buffers", redraw_definition ~= nil
 	and module_source:find("#vim.fn.win_findbuf(buf) > 0", redraw_definition, true) ~= nil
 	and first_redraw_handler ~= nil)
-check("floating redraw uses window-close hook", module_source:find('nvim_create_autocmd("WinClosed"', 1, true) ~= nil
-	and module_source:find('nvim_create_autocmd({ "CmdlineLeave"', 1, true) == nil
-	and module_source:find('nvim_create_autocmd("CmdlineEnter"', 1, true) == nil)
+check("floating redraw uses window-close hook", module_source:find('nvim_create_autocmd("WinClosed"', 1, true) ~= nil)
+check("non-key redraw uses lifecycle hooks", module_source:find('"CmdlineLeave"', 1, true) ~= nil
+	and module_source:find('"CmdwinLeave"', 1, true) ~= nil
+	and module_source:find('"FocusGained"', 1, true) ~= nil
+	and module_source:find('"VimResume"', 1, true) ~= nil
+	and module_source:find('"UIEnter"', 1, true) ~= nil
+	and module_source:find('"TabEnter"', 1, true) ~= nil)
+check("redraw requests are coalesced", module_source:find("deep_redraw_pending", 1, true) ~= nil)
+check("folded images stay above statusline", module_source:find("image_fits_window_bottom", 1, true) ~= nil
+	and module_source:find("placement.folded", 1, true) ~= nil
+	and module_source:find("image_rows(img)", 1, true) ~= nil)
+local function folded_image_fits(screen_row, rows, winrow, height)
+	return screen_row + rows <= winrow + height - 1
+end
+check("folded image hides at content boundary", folded_image_fits(22, 1, 1, 22) == false
+	and folded_image_fits(21, 1, 1, 22) == true)
+local ctrl_l_start = module_source:find('local ctrl_l = vim.keycode("<C-L>")', 1, true)
+check("Ctrl-L redraw preserves existing mappings", module_source:find("vim.on_key(function(key, typed)", 1, true) ~= nil
+	and ctrl_l_start ~= nil
+	and module_source:find("key == ctrl_l or typed == ctrl_l", ctrl_l_start or 1, true) ~= nil
+	and module_source:find("redraw_visible_buffers()", ctrl_l_start or 1, true) ~= nil)
 
 -- Production letterboxes every inline formula: scale by one proportional
 -- factor, round the terminal-cell box UP to whole cells, then pad the PNG to
