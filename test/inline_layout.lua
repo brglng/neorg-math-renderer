@@ -31,6 +31,28 @@ check("inline placeholder width is layout-bounded", module_source:find('virt_tex
 	and module_source:find("nvim_win_get_width", 1, true) ~= nil
 	and module_source:find("image_display_dimensions", 1, true) ~= nil
 	and module_source:find('virt_text_pos%s*=%s*"overlay"') == nil)
+check("visual/select mode hides every inline image on selected rows", module_source:find("is_visual_select_mode", 1, true) ~= nil
+	and module_source:find("visual_selection_rows", 1, true) ~= nil
+	and module_source:find("vim.fn.getpos, \"v\"", 1, true) ~= nil
+	and module_source:find("math.min(anchor_row, cursor_row)", 1, true) ~= nil
+	and module_source:find("math.max(anchor_row, cursor_row)", 1, true) ~= nil
+	and module_source:find('first == "v"', 1, true) ~= nil
+	and module_source:find('first == "V"', 1, true) ~= nil
+	and module_source:find('first == "\\22"', 1, true) ~= nil
+	and module_source:find('first == "s"', 1, true) ~= nil
+	and module_source:find('first == "S"', 1, true) ~= nil
+	and module_source:find('first == "\\19"', 1, true) ~= nil
+	and module_source:find("range[1] >= selection_start", 1, true) ~= nil
+	and module_source:find("range[1] <= selection_end", 1, true) ~= nil
+	and module_source:find("vim.api.nvim_get_current_buf() == buf", 1, true) ~= nil)
+check("visual/select mode transitions refresh inline visibility", module_source:find('nvim_create_autocmd("ModeChanged"', 1, true) ~= nil
+	and module_source:find("is_visual_select_mode(old_mode)", 1, true) ~= nil
+	and module_source:find("is_visual_select_mode(new_mode)", 1, true) ~= nil
+	and module_source:find("update_cursor(buf)", 1, true) ~= nil)
+check("visual/select selected rows restore source visibility", module_source:find("local reveal_source = on_cursor_row or selected_row", 1, true) ~= nil
+	and module_source:find("if selected_row then", 1, true) ~= nil
+	and module_source:find("clear_inline_extmark(buf, entry)", 1, true) ~= nil
+	and module_source:find("selected rows can be outside the current cursor line", 1, true) ~= nil)
 check("trailing whitespace conceal defaults off", module_source:find("preserve_inline_spacing = false", 1, true) ~= nil)
 check("trailing whitespace uses display-cell widths", module_source:find("inline_trailing_whitespace", 1, true) ~= nil
 	and module_source:find("display_width = vim.fn.strdisplaywidth(whitespace, source_end_column)", 1, true) ~= nil

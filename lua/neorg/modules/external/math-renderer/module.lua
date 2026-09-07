@@ -1034,9 +1034,35 @@ local function clear_inline_entry(buf, entry)
 	clear_inline_extmark(buf, entry)
 end
 
---- Return current cursor row and conceallevel for the window that displays
---- `buf`. Conceal is buffer-scoped, so use the current window when possible,
---- matching core.latex.renderer's single-window behavior.
+--- Detect visual and select modes, including character, line, and block forms.
+local function is_visual_select_mode(mode)
+	local first = type(mode) == "string" and mode:sub(1, 1)
+	return first == "v"
+		or first == "V"
+		or first == "\22"
+		or first == "s"
+		or first == "S"
+		or first == "\19"
+end
+
+--- Return the inclusive 0-indexed row range touched by a visual/select range.
+local function visual_selection_rows(mode)
+	if not is_visual_select_mode(mode) then
+		return nil, nil
+	end
+	local ok_anchor, anchor = pcall(vim.fn.getpos, "v")
+	local ok_cursor, cursor = pcall(vim.fn.getpos, ".")
+	if not ok_anchor or not ok_cursor or not anchor[2] or not cursor[2] then
+		return nil, nil
+	end
+	local anchor_row = anchor[2] - 1
+	local cursor_row = cursor[2] - 1
+	return math.min(anchor_row, cursor_row), math.max(anchor_row, cursor_row)
+end
+
+--- Return current cursor row, conceallevel, and selection rows for the window
+--- that displays `buf`. Conceal is buffer-scoped, so use the current window
+--- when possible, matching core.latex renderer's single-window behavior.
 local function inline_context(buf)
 	local current = vim.api.nvim_get_current_win()
 	local win
@@ -1051,14 +1077,21 @@ local function inline_context(buf)
 		win = wins[1]
 	end
 	if not win or not vim.api.nvim_win_is_valid(win) then
-		return nil, nil, nil
+		return nil, nil, nil, false, nil, nil
 	end
 	local row = vim.api.nvim_win_get_cursor(win)[1] - 1
 	local ok, conceallevel = pcall(vim.api.nvim_get_option_value, "conceallevel", { win = win })
 	if not ok then
 		conceallevel = 0
 	end
-	return row, conceallevel, win
+	-- Visual/select marks belong to the current buffer and window. A redraw of
+	-- another visible buffer must not reuse the active buffer's selection rows.
+	local mode = ""
+	if vim.api.nvim_get_current_buf() == buf then
+		mode = vim.api.nvim_get_mode().mode
+	end
+	local selection_start, selection_end = visual_selection_rows(mode)
+	return row, conceallevel, win, is_visual_select_mode(mode), selection_start, selection_end
 end
 
 --- Display width of source text in one inline node. This is used as a safe
@@ -1295,25 +1328,40 @@ end
 --- with visible suffix/layout nodes gets inline replacement text only when
 --- complete-line budgeting leaves safe room. A line-end formula normally gets
 --- conceal without replacement text, except for the opt-in safe trailing-space
---- width-preservation path.
+--- width-preservation path. Selected rows clear their extmark so the source
+--- remains visible while the corresponding image is hidden.
 local function update_inline_extmark(buf, entry, box)
 	local range = entry.range
 	local suffix_width, following_nodes = inline_suffix_width(buf, entry)
 	local suffix_present = suffix_width > 0 or following_nodes > 0
-	local cursor_row, conceallevel = inline_context(buf)
+	local cursor_row, conceallevel, _, visual_select_mode, selection_start, selection_end = inline_context(buf)
 	local on_cursor_row = cursor_row ~= nil and cursor_row == range[1]
+	local selected_row = visual_select_mode
+		and selection_start
+		and selection_end
+		and range[1] >= selection_start
+		and range[1] <= selection_end
+	local reveal_source = on_cursor_row or selected_row
 	local conceal_enabled = type(conceallevel) == "number" and conceallevel >= 2
 	if not module.config.public.conceal or not conceal_enabled then
 		clear_inline_extmark(buf, entry)
-		return on_cursor_row, conceal_enabled, nil, suffix_present
+		return on_cursor_row, conceal_enabled, nil, suffix_present, visual_select_mode, selected_row
 	end
 
 	-- Full-line budgeting is needed only to shift visible text after this
 	-- formula. End-of-line math uses edge width for image geometry instead.
 	local max_width = suffix_present and inline_max_width(buf, entry) or inline_edge_width(buf, entry)
-	if suffix_present and not on_cursor_row and max_width <= 0 then
+	if suffix_present and not reveal_source and max_width <= 0 then
 		clear_inline_extmark(buf, entry)
-		return on_cursor_row, conceal_enabled, max_width, suffix_present
+		return on_cursor_row, conceal_enabled, max_width, suffix_present, visual_select_mode, selected_row
+	end
+
+	-- Selected rows reveal their original source while the image is hidden.
+	-- Remove the conceal extmark rather than relying on cursor-line conceal
+	-- rules, since selected rows can be outside the current cursor line.
+	if selected_row then
+		clear_inline_extmark(buf, entry)
+		return on_cursor_row, conceal_enabled, max_width, suffix_present, visual_select_mode, selected_row
 	end
 
 	local ext_opts = {
@@ -1325,7 +1373,7 @@ local function update_inline_extmark(buf, entry, box)
 		id = entry.extmark_id,
 	}
 
-	if not on_cursor_row then
+	if not reveal_source then
 		local width = box and box.width_cells or 0
 		if max_width and width > max_width then
 			width = 0
@@ -1334,7 +1382,7 @@ local function update_inline_extmark(buf, entry, box)
 			-- A width-constrained image cannot be made smaller without applying
 			-- another scale factor. Keep source visible as a safe fallback.
 			clear_inline_extmark(buf, entry)
-			return on_cursor_row, conceal_enabled, 0, suffix_present
+			return on_cursor_row, conceal_enabled, 0, suffix_present, visual_select_mode, selected_row
 		end
 
 		-- Normally the image-width replacement is enough. With a sufficiently
@@ -1358,7 +1406,7 @@ local function update_inline_extmark(buf, entry, box)
 					-- A source-width replacement would wrap or cover suffix text.
 					-- Keep source visible instead of silently shortening its layout.
 					clear_inline_extmark(buf, entry)
-					return on_cursor_row, conceal_enabled, 0, suffix_present
+					return on_cursor_row, conceal_enabled, 0, suffix_present, visual_select_mode, selected_row
 				end
 				replacement_width = source_plus_whitespace
 				preserve_trailing = true
@@ -1383,7 +1431,7 @@ local function update_inline_extmark(buf, entry, box)
 	if ok then
 		entry.extmark_id = id
 	end
-	return on_cursor_row, conceal_enabled, max_width, suffix_present
+	return on_cursor_row, conceal_enabled, max_width, suffix_present, visual_select_mode, selected_row
 end
 
 --- Inline source is hidden by any closed fold in each window. Unlike block
@@ -1563,7 +1611,7 @@ render_inline_entry = function(buf, entry)
 		clear_inline_extmark(buf, entry)
 		return
 	end
-	local on_cursor_row, conceal_enabled, concealed_width, suffix_present = update_inline_extmark(buf, entry, box)
+	local on_cursor_row, conceal_enabled, concealed_width, suffix_present, visual_select_mode, selected_row = update_inline_extmark(buf, entry, box)
 	local width_limit = concealed_width
 	if not conceal_enabled then
 		-- Without active conceal the source remains in normal layout. Keep the
@@ -1580,6 +1628,7 @@ render_inline_entry = function(buf, entry)
 			and type(concealed_width) == "number"
 			and concealed_width <= 0
 		local hidden = inline_is_folded(entry, win)
+			or (visual_select_mode and selected_row)
 			or (module.config.public.conceal and on_cursor_row and conceal_enabled)
 			or no_conceal_room
 		if not hidden then
@@ -2302,6 +2351,24 @@ module.load = function()
 	-- were drawn on. image.nvim does not redraw on its own (no scroll or
 	-- topline change), so refresh once the command line is left.
 	local aug = vim.api.nvim_create_augroup("neorg-math-renderer", { clear = true })
+
+	-- Visual/select mode reveals the source text. Hide every inline image on
+	-- each line touched by the selection while that mode is active, then restore
+	-- normal visibility when it ends.
+	vim.api.nvim_create_autocmd("ModeChanged", {
+		group = aug,
+		callback = function()
+			local old_mode = (vim.v.event and vim.v.event.old_mode) or ""
+			local new_mode = (vim.v.event and vim.v.event.new_mode) or ""
+			if not is_visual_select_mode(old_mode) and not is_visual_select_mode(new_mode) then
+				return
+			end
+			local buf = vim.api.nvim_get_current_buf()
+			if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
+				update_cursor(buf)
+			end
+		end,
+	})
 
 	-- Fold changes can move every image without changing any buffer row.
 	-- Neovim has no FoldClosed/FoldOpened events; WinScrolled is the
