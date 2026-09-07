@@ -28,6 +28,12 @@ conceal extmarks.
   height-compliant box must fit complete-line inline layout; with no safe width,
   source stays visible and image is hidden. Block sizing remains controlled by
   `fit_window`.
+- **Optional trailing-whitespace conceal**: `preserve_inline_spacing`
+  preserves the original width after a formula followed by more than one
+  horizontal whitespace cell or a tab, including safe line-end trailing
+  spaces. Tab width uses its actual starting column; preceding inline
+  replacements and uncertain layouts use the existing image-width placeholder
+  or hide the image.
 - **`core.latex.renderer`-aligned options**: `conceal`, `dpi`,
   `render_on_enter`, `debounce_ms`, and `scale` (except `min_length`, which is
   intentionally unsupported).
@@ -128,6 +134,12 @@ All options (defaults shown):
     -- Conceal inline math source when conceallevel permits it. This never
     -- conceals `@math` block source.
     conceal = true,
+
+    -- Preserve the original source width after a formula followed by more
+    -- than one horizontal whitespace cell or a tab when layout is known safe.
+    -- This also covers line-end trailing spaces. Tab width uses its actual
+    -- starting column; uncertain multi-inline layouts use the normal fallback.
+    preserve_inline_spacing = false,
 
     -- dvipng density for the traditional `latex` backend.
     dpi = 350,
@@ -278,11 +290,22 @@ wrapped in `\[ ... \]`.
   remains visible. A non-whitespace suffix (including following inline nodes)
   uses inline replacement text only when complete raw/display line plus
   placeholders fits actual window width; one cell of slack avoids edge
-  wrapping. If the height-compliant box does not fit safe width, source stays
-  visible and image is hidden rather than applying another scale factor. A
-  line-end formula uses conceal without replacement text and normal
-  height-capped sizing when its box fits the terminal edge; otherwise source
-  stays visible. Inline images are proportionally resized and letterboxed into
+  wrapping. If `preserve_inline_spacing` is enabled, a formula followed by
+  more than one immediate horizontal whitespace cell or a tab can instead
+  conceal the formula and that whitespace with a source-width display-cell
+  placeholder
+  when the formula starts at a known column. The rendered box then occupies
+  its cells and the remaining replacement spaces, so following text keeps its
+  original screen column. The strict greater-than check compares source plus
+  whitespace display cells with the rendered box width. Tab width is measured
+  from its actual source column; preceding inline replacements and uncertain
+  layouts use the normal image-width placeholder. If the
+  source-width replacement would exceed the safe line budget, source stays
+  visible and image is hidden rather than shortening the suffix layout or
+  applying another scale factor. A line-end formula normally uses conceal
+  without replacement text, but safe trailing spaces use the same full-width
+  replacement; otherwise source stays visible. Inline images are
+  proportionally resized and letterboxed into
   ceil-cell boxes with vertical and horizontal centering. They never use
   image.nvim virtual-line padding or reserve vertical rows.
 - `scale` is a maximum inline-image height in terminal cell rows. Only inline
@@ -316,8 +339,9 @@ PATH="/Library/TeX/texbin:$PATH" nvim --headless -l test/smoke.lua
 ```
 
 A focused inline layout regression test checks safe inline conceal text,
-strict no-padding/no-virtual-line source invariants, and stale-anchor guard
-coverage:
+trailing-whitespace column preservation and conservative display-cell/layout
+rules, strict no-padding/no-virtual-line source invariants, and stale-anchor
+guard coverage:
 
 ```bash
 nvim --headless -u NONE -l test/inline_layout.lua

@@ -19,11 +19,16 @@ reservation move to a visible boundary outside the fold. Inline source is
 concealed according to `conceal`; inline images never reserve virtual lines
 and hide whenever their source row is folded. Inline replacement text is used
 only for formulas with visible suffix/layout nodes, and only when complete
-raw/display line budgeting is safe. End-of-line formulas conceal source
-without replacement text and keep normal height-capped aspect-ratio sizing
-when it fits the terminal edge; otherwise source stays visible. When an inline
-image is shown, its source is proportionally resized and letterboxed into a
-ceil-cell box: padding is centered vertically and horizontally.
+raw/display line budgeting is safe. End-of-line formulas normally conceal
+source without replacement text and keep normal height-capped aspect-ratio
+sizing when they fit the terminal edge; otherwise source stays visible.
+Optional trailing-whitespace conceal can safely preserve the original width,
+including for line-end formulas with trailing spaces, using display-cell
+widths; tabs use their actual starting-column width, while uncertain
+multi-inline layouts keep the normal fallback.
+When an inline image is shown, its source is proportionally resized and
+letterboxed into a ceil-cell box: padding is centered vertically and
+horizontally.
 
 Image backends are probed in the configured `backends` preference order:
 
@@ -83,6 +88,11 @@ module.config.public = {
 	-- never conceals `@math` block source; inline images never reserve virtual
 	-- lines, regardless of this setting.
 	conceal = true,
+
+	-- When true, safely preserve the source column after an inline formula
+	-- followed by more than one horizontal whitespace cell or a tab. Tab width
+	-- uses its actual starting column; uncertain layouts use the placeholder.
+	preserve_inline_spacing = false,
 
 	-- Dots per inch used by dvipng for the traditional `latex` backend.
 	dpi = 350,
@@ -1062,6 +1072,31 @@ local function inline_source_width(buf, range)
 	return vim.fn.strdisplaywidth(line:sub(range[2] + 1, range[4]))
 end
 
+--- Return immediate horizontal whitespace after an inline range. The end
+--- column is a byte column, while `display_width` is measured in terminal
+--- cells from the source's actual display column; keeping both avoids treating
+--- a multibyte source character or tab as one layout cell.
+local function inline_trailing_whitespace(buf, entry)
+	local range = entry.range
+	if range[1] ~= range[3] then
+		return nil
+	end
+	local line = vim.api.nvim_buf_get_lines(buf, range[1], range[1] + 1, false)[1] or ""
+	local whitespace = line:sub(range[4] + 1):match("^[ \\t]*") or ""
+	if whitespace == "" then
+		return nil
+	end
+	local source_start_column = vim.fn.strdisplaywidth(line:sub(1, range[2]))
+	local source_end_column = vim.fn.strdisplaywidth(line:sub(1, range[4]))
+	local source = line:sub(range[2] + 1, range[4])
+	return {
+		end_col = range[4] + #whitespace,
+		display_width = vim.fn.strdisplaywidth(whitespace, source_end_column),
+		has_tab = whitespace:find("\t", 1, true) ~= nil,
+		source_width = vim.fn.strdisplaywidth(source, source_start_column),
+	}
+end
+
 --- Display width of non-whitespace text after an inline range. A following
 --- inline node is also returned as layout suffix: its source is concealed,
 --- but its image still needs a placeholder before later text can be safe.
@@ -1134,6 +1169,48 @@ local function inline_text_width(win)
 	local info = vim.fn.getwininfo(win)[1]
 	local textoff = info and tonumber(info.textoff) or 0
 	return math.max(0, math.floor(win_width - textoff))
+end
+
+--- A source-width trailing-whitespace placeholder is only safe when the
+--- formula starts at a known screen column in every window. A preceding inline
+--- replacement makes the byte-column image anchor ambiguous; retain the normal
+--- image-width placeholder in that case.
+local function inline_trailing_whitespace_layout_safe(buf, entry)
+	local range = entry.range
+	if range[1] ~= range[3] then
+		return false
+	end
+	local line = vim.api.nvim_buf_get_lines(buf, range[1], range[1] + 1, false)[1] or ""
+
+	for _, other in pairs(module.private.inlines[buf] or {}) do
+		if
+			other ~= entry
+			and other.png
+			and other.range[1] == range[1]
+			and other.range[3] == range[3]
+			and other.range[4] <= range[2]
+		then
+			return false
+		end
+	end
+
+	local prefix_width = vim.fn.strdisplaywidth(line:sub(1, range[2]))
+	for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+		local text_width = inline_text_width(win)
+		if text_width <= prefix_width then
+			return false
+		end
+		local position = screen_position(win, range[1], range[2])
+		local info = vim.fn.getwininfo(win)[1]
+		if not position or not info then
+			return false
+		end
+		local expected_col = (tonumber(info.wincol) or 0) + (tonumber(info.textoff) or 0) + prefix_width
+		if position.col ~= expected_col then
+			return false
+		end
+	end
+	return true
 end
 
 --- Width available from an inline range to the terminal edge. Unlike the
@@ -1216,8 +1293,9 @@ end
 --- Update one buffer-scoped conceal extmark. Inline extmarks deliberately
 --- cover source delimiters; block entries never call this function. A formula
 --- with visible suffix/layout nodes gets inline replacement text only when
---- complete-line budgeting leaves safe room. A line-end formula gets conceal
---- without replacement text, so its image does not inherit raw-line width.
+--- complete-line budgeting leaves safe room. A line-end formula normally gets
+--- conceal without replacement text, except for the opt-in safe trailing-space
+--- width-preservation path.
 local function update_inline_extmark(buf, entry, box)
 	local range = entry.range
 	local suffix_width, following_nodes = inline_suffix_width(buf, entry)
@@ -1258,12 +1336,42 @@ local function update_inline_extmark(buf, entry, box)
 			clear_inline_extmark(buf, entry)
 			return on_cursor_row, conceal_enabled, 0, suffix_present
 		end
-		if suffix_present then
-			ext_opts.virt_text = { { string.rep(" ", width), "" } }
+
+		-- Normally the image-width replacement is enough. With a sufficiently
+		-- wide run of literal spaces after the formula, a source-width
+		-- replacement can keep later text in its original screen column. It
+		-- conceals those spaces too, so the image occupies the first `width`
+		-- cells and the remainder of the replacement stays visible to its right.
+		local replacement_width = width
+		local preserve_trailing = false
+		if module.config.public.preserve_inline_spacing then
+			local trailing = inline_trailing_whitespace(buf, entry)
+			local source_plus_whitespace = trailing
+				and trailing.source_width + trailing.display_width
+			local candidate = trailing
+				and (trailing.display_width > 1 or trailing.has_tab)
+				and source_plus_whitespace > width
+			local layout_safe = candidate
+				and inline_trailing_whitespace_layout_safe(buf, entry)
+			if layout_safe then
+				if not max_width or source_plus_whitespace > max_width then
+					-- A source-width replacement would wrap or cover suffix text.
+					-- Keep source visible instead of silently shortening its layout.
+					clear_inline_extmark(buf, entry)
+					return on_cursor_row, conceal_enabled, 0, suffix_present
+				end
+				replacement_width = source_plus_whitespace
+				preserve_trailing = true
+				ext_opts.end_col = trailing.end_col
+			end
+		end
+		if suffix_present or preserve_trailing then
+			ext_opts.virt_text = { { string.rep(" ", replacement_width), "" } }
 			ext_opts.virt_text_pos = "inline"
 		end
-		-- End-of-line conceal intentionally has no replacement text. This keeps
-		-- concealed source from adding a wrapping placeholder of its own.
+		-- End-of-line conceal normally has no replacement text. The opt-in
+		-- trailing-whitespace path is the exception: its replacement preserves
+		-- the full source-plus-space width.
 		ext_opts.conceal = ""
 	else
 		-- Explicitly clear replacement text left by the previous non-cursor

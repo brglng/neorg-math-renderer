@@ -31,10 +31,24 @@ check("inline placeholder width is layout-bounded", module_source:find('virt_tex
 	and module_source:find("nvim_win_get_width", 1, true) ~= nil
 	and module_source:find("image_display_dimensions", 1, true) ~= nil
 	and module_source:find('virt_text_pos%s*=%s*"overlay"') == nil)
+check("trailing whitespace conceal defaults off", module_source:find("preserve_inline_spacing = false", 1, true) ~= nil)
+check("trailing whitespace uses display-cell widths", module_source:find("inline_trailing_whitespace", 1, true) ~= nil
+	and module_source:find("display_width = vim.fn.strdisplaywidth(whitespace, source_end_column)", 1, true) ~= nil
+	and module_source:find("source_plus_whitespace > width", 1, true) ~= nil)
+check("trailing whitespace requires a known safe layout", module_source:find("inline_trailing_whitespace_layout_safe", 1, true) ~= nil
+	and module_source:find("other.range[4] <= range[2]", 1, true) ~= nil
+	and module_source:find("line:find(\"\\t\", 1, true)", 1, true) == nil)
+check("trailing whitespace expands the concealed range", module_source:find("ext_opts.end_col = trailing.end_col", 1, true) ~= nil
+	and module_source:find("string.rep(\" \", replacement_width)", 1, true) ~= nil
+	and module_source:find("suffix_present or preserve_trailing", 1, true) ~= nil)
+check("unsafe source-width replacement keeps source visible", module_source:find("source_plus_whitespace > max_width", 1, true) ~= nil
+	and module_source:find("return on_cursor_row, conceal_enabled, 0, suffix_present", 1, true) ~= nil)
+check("line-end trailing whitespace can preserve width", module_source:find("local max_width = suffix_present and inline_max_width(buf, entry) or inline_edge_width(buf, entry)", 1, true) ~= nil
+	and module_source:find("preserve_trailing = true", 1, true) ~= nil)
 check("line-end layout bypasses raw-line budget", module_source:find("inline_suffix_width", 1, true) ~= nil
 	and module_source:find("inline_edge_width", 1, true) ~= nil
 	and module_source:find("suffix_present and inline_max_width", 1, true) ~= nil
-	and module_source:find("End-of-line conceal intentionally has no replacement text", 1, true) ~= nil)
+	and module_source:find("End-of-line conceal normally has no replacement text", 1, true) ~= nil)
 check("inline image disables virtual padding", inline_source:find("with_virtual_padding%s*=%s*false") ~= nil)
 check("inline image has no virtual-line options", inline_source:find("virt_lines") == nil)
 check("inline geometry uses ceil-cell box", module_source:find("math.ceil(scaled_width / term.cell_width)", 1, true) ~= nil
@@ -168,6 +182,87 @@ local function next_line_screen_row(line, virtual_text_pos, width)
 	local next_line = vim.fn.screenpos(0, 2, 1)
 	return first.row, next_line.row
 end
+
+-- Model the optional source-width placeholder in display cells. The boolean
+-- result makes the strict inequality observable even when the fallback width
+-- happens to equal the requested width.
+local function trailing_placeholder_width(source, whitespace, box_width, enabled, safe, source_column)
+	source_column = source_column or 0
+	local source_width = vim.fn.strdisplaywidth(source, source_column)
+	local whitespace_width = vim.fn.strdisplaywidth(whitespace, source_column + source_width)
+	if enabled and safe and (whitespace_width > 1 or whitespace:find("\t", 1, true))
+		and source_width + whitespace_width > box_width then
+		return source_width + whitespace_width, true
+	end
+	return box_width, false
+end
+
+local function suffix_screen_col(line, start_col, source_end_col, conceal_end_col, replacement_width)
+	vim.api.nvim_buf_set_lines(0, 0, -1, false, { line, "NEXT" })
+	vim.api.nvim_buf_clear_namespace(0, namespace, 0, -1)
+	vim.api.nvim_win_set_cursor(0, { 2, 0 })
+	vim.api.nvim_buf_set_extmark(0, namespace, 0, start_col, {
+		end_col = conceal_end_col,
+		conceal = "",
+		strict = false,
+		virt_text = { { string.rep(" ", replacement_width), "" } },
+		virt_text_pos = "inline",
+	})
+	vim.cmd("redraw!")
+	local screen = ""
+	for col = 1, vim.api.nvim_win_get_width(0) do
+		screen = screen .. vim.fn.screenstring(1, col)
+	end
+	return assert(screen:find("SUFFIX", 1, true))
+end
+
+vim.wo.wrap = false
+local layout_line = "P1234  SUFFIX"
+local layout_source = "1234"
+local layout_start = assert(layout_line:find(layout_source, 1, true)) - 1
+local layout_source_end = layout_start + #layout_source
+local layout_whitespace_end = layout_source_end + 2
+local original_suffix_col = vim.fn.strdisplaywidth("P" .. layout_source .. "  ") + 1
+local fallback_suffix_col = suffix_screen_col(
+	layout_line,
+	layout_start,
+	layout_source_end,
+	layout_source_end,
+	3
+)
+local preserved_suffix_col = suffix_screen_col(
+	layout_line,
+	layout_start,
+	layout_source_end,
+	layout_whitespace_end,
+	6
+)
+check("trailing whitespace layout preserves the suffix column", preserved_suffix_col == original_suffix_col)
+check("disabled trailing whitespace uses image-width fallback", fallback_suffix_col ~= original_suffix_col
+	and fallback_suffix_col == vim.fn.strdisplaywidth("P") + 3 + vim.fn.strdisplaywidth("  ") + 1)
+local tab_line = "P1234\tSUFFIX"
+local tab_suffix_col = suffix_screen_col(tab_line, 1, 5, 6, 7)
+check("tab replacement preserves the original suffix column", tab_suffix_col == vim.fn.strdisplaywidth("P1234\t") + 1)
+
+local default_width, default_expanded = trailing_placeholder_width(layout_source, "  ", 3, false, true)
+check("default-off trailing whitespace leaves image width", default_width == 3 and not default_expanded)
+local equal_width, equal_expanded = trailing_placeholder_width(layout_source, "  ", 6, true, true)
+local greater_width, greater_expanded = trailing_placeholder_width(layout_source, "  ", 5, true, true)
+check("trailing whitespace uses strict greater-than", equal_width == 6 and not equal_expanded
+	and greater_width == 6 and greater_expanded)
+local wide_source_width, wide_source_expanded = trailing_placeholder_width("界", "  ", 3, true, true)
+check("trailing whitespace compares display cells", #"界" > vim.fn.strdisplaywidth("界")
+	and wide_source_width == 4 and wide_source_expanded)
+local line_end_width, line_end_expanded = trailing_placeholder_width(layout_source, "  ", 5, true, true)
+check("line-end trailing spaces preserve full source width", line_end_width == 6 and line_end_expanded)
+local unsafe_width, unsafe_expanded = trailing_placeholder_width(layout_source, "  ", 3, true, false)
+check("unsafe layout leaves a non-expanding fallback", unsafe_width == 3 and not unsafe_expanded)
+local tab_width, tab_expanded = trailing_placeholder_width(layout_source, "\t ", 3, true, true, 1)
+local single_cell_tab_width, single_cell_tab_expanded = trailing_placeholder_width(layout_source, "\t", 4, true, true, 3)
+local multi_inline_width, multi_inline_expanded = trailing_placeholder_width(layout_source, "  ", 3, true, false)
+check("tabs use actual display cells and uncertain multi-inline layouts fallback", tab_width == 8 and tab_expanded
+	and single_cell_tab_width == 5 and single_cell_tab_expanded
+	and multi_inline_width == 3 and not multi_inline_expanded)
 
 vim.wo.wrap = true
 
