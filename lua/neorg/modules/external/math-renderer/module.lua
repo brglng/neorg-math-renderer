@@ -17,18 +17,15 @@ Block LaTeX source stays visible. Block images are placed on reserved
 virtual lines above or below the block; when a block is folded, its image and
 reservation move to a visible boundary outside the fold. Inline source is
 concealed according to `conceal`; inline images never reserve virtual lines
-and hide whenever their source row is folded. Inline replacement text is used
-only for formulas with visible suffix/layout nodes, and only when complete
-raw/display line budgeting is safe. End-of-line formulas normally conceal
+and hide whenever their source row is folded. A formula with a visible suffix
+keeps its image box at the ceil-cell width using buffer-scoped inline placeholders,
+a separate conceal mark for any source wider than the box, and end-of-line
+inline padding for a box wider than its source; this keeps the visual box
+width without adding source-width wrapping. End-of-line formulas conceal
 source without replacement text and keep normal height-capped aspect-ratio
-sizing when they fit the terminal edge; otherwise source stays visible.
-Optional trailing-whitespace conceal can safely preserve the original width,
-including for line-end formulas with trailing spaces, using display-cell
-widths; tabs use their actual starting-column width, while uncertain
-multi-inline layouts keep the normal fallback.
-When an inline image is shown, its source is proportionally resized and
-letterboxed into a ceil-cell box: padding is centered vertically and
-horizontally.
+sizing when they fit the terminal edge; otherwise source stays visible. When an
+inline image is shown, its source is proportionally resized and letterboxed into
+a ceil-cell box: padding is centered vertically and horizontally.
 
 Image backends are probed in the configured `backends` preference order:
 
@@ -88,11 +85,6 @@ module.config.public = {
 	-- never conceals `@math` block source; inline images never reserve virtual
 	-- lines, regardless of this setting.
 	conceal = true,
-
-	-- When true, safely preserve the source column after an inline formula
-	-- followed by more than one horizontal whitespace cell or a tab. Tab width
-	-- uses its actual starting column; uncertain layouts use the placeholder.
-	preserve_inline_spacing = false,
 
 	-- Dots per inch used by dvipng for the traditional `latex` backend.
 	dpi = 350,
@@ -355,7 +347,7 @@ local function get_inline_math(buf)
 				box_generation = 0,
 				box_unavailable = false,
 				images = {},
-				extmark_id = nil,
+				extmark_ids = {},
 				shown = false,
 				pending = false,
 			}
@@ -1022,11 +1014,14 @@ end
 -- inline math apply / conceal
 --------------------------------------------------------------------------------
 
+--- Remove every buffer-scoped extmark created for `entry`. Inline layout can
+--- span buffer-scoped conceal and inline placeholder marks, so all ids recorded
+--- on the entry are dropped to avoid stale marks between redraws.
 local function clear_inline_extmark(buf, entry)
-	if entry.extmark_id then
-		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, entry.extmark_id)
-		entry.extmark_id = nil
+	for _, id in ipairs(entry.extmark_ids or {}) do
+		pcall(vim.api.nvim_buf_del_extmark, buf, module.private.ns, id)
 	end
+	entry.extmark_ids = {}
 end
 
 local function clear_inline_entry(buf, entry)
@@ -1105,31 +1100,6 @@ local function inline_source_width(buf, range)
 	return vim.fn.strdisplaywidth(line:sub(range[2] + 1, range[4]))
 end
 
---- Return immediate horizontal whitespace after an inline range. The end
---- column is a byte column, while `display_width` is measured in terminal
---- cells from the source's actual display column; keeping both avoids treating
---- a multibyte source character or tab as one layout cell.
-local function inline_trailing_whitespace(buf, entry)
-	local range = entry.range
-	if range[1] ~= range[3] then
-		return nil
-	end
-	local line = vim.api.nvim_buf_get_lines(buf, range[1], range[1] + 1, false)[1] or ""
-	local whitespace = line:sub(range[4] + 1):match("^[ \\t]*") or ""
-	if whitespace == "" then
-		return nil
-	end
-	local source_start_column = vim.fn.strdisplaywidth(line:sub(1, range[2]))
-	local source_end_column = vim.fn.strdisplaywidth(line:sub(1, range[4]))
-	local source = line:sub(range[2] + 1, range[4])
-	return {
-		end_col = range[4] + #whitespace,
-		display_width = vim.fn.strdisplaywidth(whitespace, source_end_column),
-		has_tab = whitespace:find("\t", 1, true) ~= nil,
-		source_width = vim.fn.strdisplaywidth(source, source_start_column),
-	}
-end
-
 --- Display width of non-whitespace text after an inline range. A following
 --- inline node is also returned as layout suffix: its source is concealed,
 --- but its image still needs a placeholder before later text can be safe.
@@ -1204,48 +1174,6 @@ local function inline_text_width(win)
 	return math.max(0, math.floor(win_width - textoff))
 end
 
---- A source-width trailing-whitespace placeholder is only safe when the
---- formula starts at a known screen column in every window. A preceding inline
---- replacement makes the byte-column image anchor ambiguous; retain the normal
---- image-width placeholder in that case.
-local function inline_trailing_whitespace_layout_safe(buf, entry)
-	local range = entry.range
-	if range[1] ~= range[3] then
-		return false
-	end
-	local line = vim.api.nvim_buf_get_lines(buf, range[1], range[1] + 1, false)[1] or ""
-
-	for _, other in pairs(module.private.inlines[buf] or {}) do
-		if
-			other ~= entry
-			and other.png
-			and other.range[1] == range[1]
-			and other.range[3] == range[3]
-			and other.range[4] <= range[2]
-		then
-			return false
-		end
-	end
-
-	local prefix_width = vim.fn.strdisplaywidth(line:sub(1, range[2]))
-	for _, win in ipairs(vim.fn.win_findbuf(buf)) do
-		local text_width = inline_text_width(win)
-		if text_width <= prefix_width then
-			return false
-		end
-		local position = screen_position(win, range[1], range[2])
-		local info = vim.fn.getwininfo(win)[1]
-		if not position or not info then
-			return false
-		end
-		local expected_col = (tonumber(info.wincol) or 0) + (tonumber(info.textoff) or 0) + prefix_width
-		if position.col ~= expected_col then
-			return false
-		end
-	end
-	return true
-end
-
 --- Width available from an inline range to the terminal edge. Unlike the
 --- complete-line budget, this accounts only for the visible prefix before the
 --- formula. It keeps line-end images inside a sensible edge when possible,
@@ -1297,12 +1225,29 @@ local function inline_other_placeholder_width(buf, entry)
 	return total
 end
 
+--- Source widths of other ready inline formulas on the same raw line. These
+--- bytes are removed when their own conceal placeholders are active, so they
+--- must not remain in the final line budget.
+local function inline_other_concealed_width(buf, entry)
+	local total = 0
+	for _, other in pairs(module.private.inlines[buf] or {}) do
+		if
+			other ~= entry
+			and other.png
+			and other.box_geometry
+			and other.range[1] == entry.range[1]
+			and other.range[3] == entry.range[3]
+		then
+			total = total + inline_source_width(buf, other.range)
+		end
+	end
+	return total
+end
+
 --- Maximum safe inline placeholder width for a formula with visible text or
---- following inline nodes. Compare actual window text width against complete
---- raw/display line plus all placeholders. Leave one cell slack: exact-width
---- inline text can still wrap at terminal edge. Returning zero keeps source
---- visible and hides image instead of covering suffix text. Line-end formulas
---- use inline_edge_width instead and never enter this full-line budget.
+--- following inline nodes. Derive final line width by removing the current and
+--- other concealed source spans before adding their actual placeholders. Leave
+--- one cell slack so exact-width inline text cannot wrap at the edge.
 local function inline_max_width(buf, entry)
 	local suffix_width, following_nodes = inline_suffix_width(buf, entry)
 	if suffix_width <= 0 and following_nodes == 0 then
@@ -1312,10 +1257,16 @@ local function inline_max_width(buf, entry)
 	if raw_width == math.huge then
 		return 0
 	end
-	local other_width = inline_other_placeholder_width(buf, entry)
+	local current_source_width = inline_source_width(buf, entry.range)
+	local other_source_width = inline_other_concealed_width(buf, entry)
+	local other_placeholder_width = inline_other_placeholder_width(buf, entry)
+	local final_without_current = raw_width
+		- current_source_width
+		- other_source_width
+		+ other_placeholder_width
 	local limit = math.huge
 	for _, win in ipairs(vim.fn.win_findbuf(buf)) do
-		limit = math.min(limit, inline_text_width(win) - raw_width - other_width - 1)
+		limit = math.min(limit, inline_text_width(win) - final_without_current - 1)
 	end
 	if limit == math.huge then
 		return 0
@@ -1323,13 +1274,60 @@ local function inline_max_width(buf, entry)
 	return math.max(0, math.floor(limit))
 end
 
---- Update one buffer-scoped conceal extmark. Inline extmarks deliberately
---- cover source delimiters; block entries never call this function. A formula
---- with visible suffix/layout nodes gets inline replacement text only when
---- complete-line budgeting leaves safe room. A line-end formula normally gets
---- conceal without replacement text, except for the opt-in safe trailing-space
---- width-preservation path. Selected rows clear their extmark so the source
---- remains visible while the corresponding image is hidden.
+--- Record a newly created extmark id on `entry` so it can be cleaned up later.
+--- Create one buffer-scoped inline extmark and record its id on `entry` so
+--- it can be removed on the next redraw. The plan marks carry `row`/`col` as
+--- keyed fields for shape inspection, but `nvim_buf_set_extmark` rejects those
+--- keys in opts, so build a clean opts table for the API call.
+local function track_inline_extmark(buf, entry, opts)
+	local row, col = opts.row, opts.col
+	local clean = {}
+	for k, v in pairs(opts) do
+		if k ~= "row" and k ~= "col" then
+			clean[k] = v
+		end
+	end
+	local ok, id = pcall(vim.api.nvim_buf_set_extmark, buf, module.private.ns, row, col, clean)
+	if ok then
+		table.insert(entry.extmark_ids, id)
+	end
+	return ok and id or nil
+end
+
+--- Compute one image.nvim-compatible inline placeholder for an inline source
+--- span. All box widths use the same explicit conceal + inline replacement so
+--- later image anchors can be corrected from the conceal extmark.
+local function inline_layout_plan(buf, entry, box)
+	local range = entry.range
+	if range[1] ~= range[3] or not box or box.width_cells <= 0 then
+		return nil
+	end
+	return {
+		{
+			row = range[1],
+			col = range[2],
+			end_row = range[3],
+			end_col = range[4],
+			strict = false,
+			invalidate = true,
+			undo_restore = false,
+			conceal = "",
+			virt_text = { { string.rep(" ", box.width_cells), "" } },
+			virt_text_pos = "inline",
+		},
+	}
+end
+
+--- Update the buffer-scoped inline extmark set. Inline extmarks deliberately
+--- cover source delimiters; block entries never call this function.
+---
+--- Layout keeps the visual box at `box.width_cells` cells without changing
+--- source-width wrapping (see `inline_layout_plan`). A line-end formula uses
+--- a single conceal mark so the image can extend
+--- over trailing space. Selected rows and the cursor row reveal source. When
+--- the final-line layout budget cannot fit the box or safety is unknown, no
+--- mark is installed: source stays visible and the image is hidden (zero
+--- concealed width).
 local function update_inline_extmark(buf, entry, box)
 	local range = entry.range
 	local suffix_width, following_nodes = inline_suffix_width(buf, entry)
@@ -1341,97 +1339,104 @@ local function update_inline_extmark(buf, entry, box)
 		and selection_end
 		and range[1] >= selection_start
 		and range[1] <= selection_end
-	local reveal_source = on_cursor_row or selected_row
 	local conceal_enabled = type(conceallevel) == "number" and conceallevel >= 2
+	local width = box and box.width_cells or 0
+
 	if not module.config.public.conceal or not conceal_enabled then
 		clear_inline_extmark(buf, entry)
 		return on_cursor_row, conceal_enabled, nil, suffix_present, visual_select_mode, selected_row
 	end
+	clear_inline_extmark(buf, entry)
 
-	-- Full-line budgeting is needed only to shift visible text after this
-	-- formula. End-of-line math uses edge width for image geometry instead.
-	local max_width = suffix_present and inline_max_width(buf, entry) or inline_edge_width(buf, entry)
-	if suffix_present and not reveal_source and max_width <= 0 then
-		clear_inline_extmark(buf, entry)
-		return on_cursor_row, conceal_enabled, max_width, suffix_present, visual_select_mode, selected_row
-	end
-
-	-- Selected rows reveal their original source while the image is hidden.
-	-- Remove the conceal extmark rather than relying on cursor-line conceal
-	-- rules, since selected rows can be outside the current cursor line.
+	-- Selected rows reveal the original source in every window.
 	if selected_row then
-		clear_inline_extmark(buf, entry)
-		return on_cursor_row, conceal_enabled, max_width, suffix_present, visual_select_mode, selected_row
+		return on_cursor_row, conceal_enabled, width, suffix_present, visual_select_mode, selected_row
 	end
 
-	local ext_opts = {
-		end_row = range[3],
-		end_col = range[4],
-		strict = false,
-		invalidate = true,
-		undo_restore = false,
-		id = entry.extmark_id,
-	}
-
-	if not reveal_source then
-		local width = box and box.width_cells or 0
-		if max_width and width > max_width then
-			width = 0
+	-- Cursor row: reveal source here through concealcursor while other windows
+	-- displaying the buffer keep concealing it.
+	if on_cursor_row then
+		if range[1] == range[3] and width > 0 then
+			track_inline_extmark(buf, entry, {
+				row = range[1],
+				col = range[2],
+				end_row = range[3],
+				end_col = range[4],
+				conceal = "",
+				strict = false,
+				invalidate = true,
+				undo_restore = false,
+			})
 		end
-		if width <= 0 then
-			-- A width-constrained image cannot be made smaller without applying
-			-- another scale factor. Keep source visible as a safe fallback.
-			clear_inline_extmark(buf, entry)
+		return on_cursor_row, conceal_enabled, width, suffix_present, visual_select_mode, selected_row
+	end
+
+	-- Multiline or no measurable box: keep the source visible, hide the image.
+	if range[1] ~= range[3] or width <= 0 then
+		return on_cursor_row, conceal_enabled, 0, suffix_present, visual_select_mode, selected_row
+	end
+
+	-- A formula at end of line uses one conceal mark so the image can extend
+	-- over trailing space.
+	if not suffix_present then
+		local edge = inline_edge_width(buf, entry)
+		if width > edge then
+			-- Would cross the terminal edge: safety unknown -> visible fallback.
 			return on_cursor_row, conceal_enabled, 0, suffix_present, visual_select_mode, selected_row
 		end
-
-		-- Normally the image-width replacement is enough. With a sufficiently
-		-- wide run of literal spaces after the formula, a source-width
-		-- replacement can keep later text in its original screen column. It
-		-- conceals those spaces too, so the image occupies the first `width`
-		-- cells and the remainder of the replacement stays visible to its right.
-		local replacement_width = width
-		local preserve_trailing = false
-		if module.config.public.preserve_inline_spacing then
-			local trailing = inline_trailing_whitespace(buf, entry)
-			local source_plus_whitespace = trailing
-				and trailing.source_width + trailing.display_width
-			local candidate = trailing
-				and (trailing.display_width > 1 or trailing.has_tab)
-				and source_plus_whitespace > width
-			local layout_safe = candidate
-				and inline_trailing_whitespace_layout_safe(buf, entry)
-			if layout_safe then
-				if not max_width or source_plus_whitespace > max_width then
-					-- A source-width replacement would wrap or cover suffix text.
-					-- Keep source visible instead of silently shortening its layout.
-					clear_inline_extmark(buf, entry)
-					return on_cursor_row, conceal_enabled, 0, suffix_present, visual_select_mode, selected_row
-				end
-				replacement_width = source_plus_whitespace
-				preserve_trailing = true
-				ext_opts.end_col = trailing.end_col
-			end
-		end
-		if suffix_present or preserve_trailing then
-			ext_opts.virt_text = { { string.rep(" ", replacement_width), "" } }
-			ext_opts.virt_text_pos = "inline"
-		end
-		-- End-of-line conceal normally has no replacement text. The opt-in
-		-- trailing-whitespace path is the exception: its replacement preserves
-		-- the full source-plus-space width.
-		ext_opts.conceal = ""
-	else
-		-- Explicitly clear replacement text left by the previous non-cursor
-		-- pass. This matches core.latex renderer's cursor reveal behavior.
-		ext_opts.virt_text = { { "", "" } }
+		track_inline_extmark(buf, entry, {
+			row = range[1],
+			col = range[2],
+			end_row = range[3],
+			end_col = range[4],
+			conceal = "",
+			strict = false,
+			invalidate = true,
+			undo_restore = false,
+		})
+		return on_cursor_row, conceal_enabled, width, suffix_present, visual_select_mode, selected_row
 	end
 
-	local ok, id = pcall(vim.api.nvim_buf_set_extmark, buf, module.private.ns, range[1], range[2], ext_opts)
-	if ok then
-		entry.extmark_id = id
+	-- Visible suffix: the complete final-line budget (source spans replaced by
+	-- their own compact boxes) must fit the box in every window. An exhausted
+	-- budget or a box wider than it proves the final layout unsafe, so no
+	-- mark is installed: source stays visible and the image hides.
+	local max_width = inline_max_width(buf, entry)
+	if max_width == nil then
+		max_width = 0
+	end
+	if max_width <= 0 or width > max_width then
+		return on_cursor_row, conceal_enabled, 0, suffix_present, visual_select_mode, selected_row
+	end
+
+	-- Apply the compact inline placeholder plan at absolute source columns.
+	local plan = inline_layout_plan(buf, entry, box)
+	if not plan then
+		return on_cursor_row, conceal_enabled, 0, suffix_present, visual_select_mode, selected_row
+	end
+	for _, m in ipairs(plan) do
+		track_inline_extmark(buf, entry, m)
 	end
 	return on_cursor_row, conceal_enabled, max_width, suffix_present, visual_select_mode, selected_row
+end
+
+--- Apply one inline layout and retain the state needed by image rendering.
+--- Keeping this result separate lets a buffer-wide pass apply every conceal
+--- extmark before any image asks image.nvim to resolve its screen anchor.
+local function inline_layout_state(buf, entry, box)
+	local on_cursor_row, conceal_enabled, concealed_width, suffix_present, visual_select_mode, selected_row = update_inline_extmark(
+		buf,
+		entry,
+		box
+	)
+	return {
+		on_cursor_row = on_cursor_row,
+		conceal_enabled = conceal_enabled,
+		concealed_width = concealed_width,
+		suffix_present = suffix_present,
+		visual_select_mode = visual_select_mode,
+		selected_row = selected_row,
+	}
 end
 
 --- Inline source is hidden by any closed fold in each window. Unlike block
@@ -1586,7 +1591,7 @@ local function ensure_inline_box_png(buf, entry)
 	end)
 end
 
-render_inline_entry = function(buf, entry)
+render_inline_entry = function(buf, entry, layout)
 	if not entry.png or not entry.box_png or not entry.box_geometry then
 		clear_image(entry)
 		clear_inline_extmark(buf, entry)
@@ -1611,7 +1616,16 @@ render_inline_entry = function(buf, entry)
 		clear_inline_extmark(buf, entry)
 		return
 	end
-	local on_cursor_row, conceal_enabled, concealed_width, suffix_present, visual_select_mode, selected_row = update_inline_extmark(buf, entry, box)
+	-- Direct callers do not have a buffer-wide layout pass to supply state;
+	-- apply this entry once in that case. A compact pass supplies the state
+	-- after all ready entries have updated their extmarks.
+	layout = layout or inline_layout_state(buf, entry, box)
+	local on_cursor_row = layout.on_cursor_row
+	local conceal_enabled = layout.conceal_enabled
+	local concealed_width = layout.concealed_width
+	local suffix_present = layout.suffix_present
+	local visual_select_mode = layout.visual_select_mode
+	local selected_row = layout.selected_row
 	local width_limit = concealed_width
 	if not conceal_enabled then
 		-- Without active conceal the source remains in normal layout. Keep the
@@ -1742,6 +1756,38 @@ local function sync_inline_windows(buf)
 	end
 end
 
+--- Return ready inline entries in source order. State is keyed by source range,
+--- so `pairs()` order is intentionally not used for layout or image anchors.
+local function ready_inline_entries(buf, state)
+	local entries = {}
+	for _, entry in pairs(state) do
+		if entry.shown and entry.png and entry.box_png and entry.box_geometry then
+			table.insert(entries, entry)
+		elseif entry.shown then
+			clear_image(entry)
+			clear_inline_extmark(buf, entry)
+		end
+	end
+	table.sort(entries, function(a, b)
+		local ar, ac, aer, aec = a.range[1], a.range[2], a.range[3], a.range[4]
+		local br, bc, ber, bec = b.range[1], b.range[2], b.range[3], b.range[4]
+		if ar ~= br then
+			return ar < br
+		end
+		if ac ~= bc then
+			return ac < bc
+		end
+		if aer ~= ber then
+			return aer < ber
+		end
+		if aec ~= bec then
+			return aec < bec
+		end
+		return tostring(a.key or "") < tostring(b.key or "")
+	end)
+	return entries
+end
+
 render_inline_state = function(buf)
 	local state = module.private.inlines[buf] or {}
 	-- Ensure every formula has its letterboxed box PNG first. While padding is
@@ -1755,17 +1801,24 @@ render_inline_state = function(buf)
 	-- lets each entry account for other placeholders on its raw line, even
 	-- when several formulas share one line.
 	for _, entry in pairs(state) do
-		if entry.shown and entry.png and entry.box_png then
+		if entry.shown and entry.png and entry.box_png and entry.box_geometry then
 			ensure_inline_images(buf, entry)
-		elseif entry.shown then
-			clear_image(entry)
-			clear_inline_extmark(buf, entry)
 		end
 	end
-	for _, entry in pairs(state) do
-		if entry.shown and entry.png and entry.box_png then
-			render_inline_entry(buf, entry)
-		end
+
+	local entries = ready_inline_entries(buf, state)
+	-- Phase one applies every conceal extmark in stable source order. Image
+	-- rendering must wait until this complete compact layout is in place:
+	-- otherwise an earlier image can resolve its anchor before a later formula
+	-- changes the inline text layout on the same raw line.
+	local layouts = {}
+	for _, entry in ipairs(entries) do
+		layouts[entry] = inline_layout_state(buf, entry, entry.box_geometry)
+	end
+	-- Phase two renders against the already-complete layout without applying
+	-- any extmark again.
+	for _, entry in ipairs(entries) do
+		render_inline_entry(buf, entry, layouts[entry])
 	end
 end
 
@@ -1898,18 +1951,15 @@ local function deep_redraw(buf)
 				end
 			end
 		end
-		local inline_state = module.private.inlines[buf] or {}
-		for _, entry in pairs(inline_state) do
+		-- Recreate inline images, then use the same two-phase compact layout as
+		-- every other buffer-wide refresh so multiple formulas share stable
+		-- source-order anchors.
+		for _, entry in pairs(module.private.inlines[buf] or {}) do
 			if entry.shown and entry.png then
 				clear_image(entry)
-				ensure_inline_images(buf, entry)
 			end
 		end
-		for _, entry in pairs(inline_state) do
-			if entry.shown and entry.png then
-				render_inline_entry(buf, entry)
-			end
-		end
+		render_inline_state(buf)
 	end, 100)
 end
 
