@@ -185,10 +185,6 @@ local function dvipng_bg_arg()
 	return dvipng_rgb_arg(bg)
 end
 
---- Convert one snippet with the ratex-render CLI.
----@param snippet string
----@param key string unique cache key for this snippet (temp dir name)
----@param done fun(path: string|nil, err: string|nil)
 --- Custom invocation for `backend`, or nil when configured with a plain
 --- executable name (built-in pipeline).
 ---@param backend string
@@ -217,6 +213,10 @@ local function strip_inline_delimiters(snippet)
 	return snippet
 end
 
+--- Convert one snippet with the ratex-render CLI.
+---@param snippet string
+---@param key string unique cache key for this snippet (temp dir name)
+---@param done fun(path: string|nil, err: string|nil)
 local function render_ratex(snippet, key, done, render_opts)
 	-- ratex-render reads one formula per line; flatten the block source.
 	local line = (snippet:gsub("%s*\n%s*", " "))
@@ -319,8 +319,8 @@ local function render_tex2svg(snippet, key, done, render_opts)
 		local dir = job_dir(key .. "-tex2svg")
 		local svg_path = dir .. "/formula.svg"
 		local png_path = dir .. "/formula.png"
-		-- Same NUL-byte caveat: SVG text from process stdout contains newlines
-		-- and must be split into a line list before writefile.
+		-- `vim.fn.writefile` takes a list of lines, so split the process
+		-- output on '\n' before writing the SVG file.
 		vim.fn.writefile(vim.split(svg, "\n", { plain = true }), svg_path)
 
 		run(rasterize(svg_path, png_path), nil, function(rc, _, rerr)

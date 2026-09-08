@@ -1274,7 +1274,6 @@ local function inline_max_width(buf, entry)
 	return math.max(0, math.floor(limit))
 end
 
---- Record a newly created extmark id on `entry` so it can be cleaned up later.
 --- Create one buffer-scoped inline extmark and record its id on `entry` so
 --- it can be removed on the next redraw. The plan marks carry `row`/`col` as
 --- keyed fields for shape inspection, but `nvim_buf_set_extmark` rejects those
@@ -1318,6 +1317,25 @@ local function inline_layout_plan(buf, entry, box)
 	}
 end
 
+--- Options for one buffer-scoped conceal extmark covering a single inline
+--- source span. The cursor-row reveal and the line-end formula both use the
+--- identical mark: conceal the source bytes with no replacement text.
+---@param entry table
+---@return table
+local function inline_conceal_mark_opts(entry)
+	local range = entry.range
+	return {
+		row = range[1],
+		col = range[2],
+		end_row = range[3],
+		end_col = range[4],
+		conceal = "",
+		strict = false,
+		invalidate = true,
+		undo_restore = false,
+	}
+end
+
 --- Update the buffer-scoped inline extmark set. Inline extmarks deliberately
 --- cover source delimiters; block entries never call this function.
 ---
@@ -1357,16 +1375,7 @@ local function update_inline_extmark(buf, entry, box)
 	-- displaying the buffer keep concealing it.
 	if on_cursor_row then
 		if range[1] == range[3] and width > 0 then
-			track_inline_extmark(buf, entry, {
-				row = range[1],
-				col = range[2],
-				end_row = range[3],
-				end_col = range[4],
-				conceal = "",
-				strict = false,
-				invalidate = true,
-				undo_restore = false,
-			})
+			track_inline_extmark(buf, entry, inline_conceal_mark_opts(entry))
 		end
 		return on_cursor_row, conceal_enabled, width, suffix_present, visual_select_mode, selected_row
 	end
@@ -1384,16 +1393,7 @@ local function update_inline_extmark(buf, entry, box)
 			-- Would cross the terminal edge: safety unknown -> visible fallback.
 			return on_cursor_row, conceal_enabled, 0, suffix_present, visual_select_mode, selected_row
 		end
-		track_inline_extmark(buf, entry, {
-			row = range[1],
-			col = range[2],
-			end_row = range[3],
-			end_col = range[4],
-			conceal = "",
-			strict = false,
-			invalidate = true,
-			undo_restore = false,
-		})
+		track_inline_extmark(buf, entry, inline_conceal_mark_opts(entry))
 		return on_cursor_row, conceal_enabled, width, suffix_present, visual_select_mode, selected_row
 	end
 
@@ -2027,7 +2027,7 @@ local function show_entry(buf, entry)
 	end)
 end
 
-------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
 -- rendering passes
 --------------------------------------------------------------------------------
 
