@@ -2217,6 +2217,35 @@ local function show_hidden(buf)
 	render_inline_state(buf)
 end
 
+--- Drop every image and all cached state for `buf`. Called on
+--- BufUnload/BufWipeout (`:bd`, `:bunload`, `:bwipeout`). image.nvim's own
+--- auto-cleanup only clears images that still carry a window handle, which
+--- folded block images (rendered detached, `image.window = nil`) do not, and
+--- no BufLeave fires when the buffer is only shown in a non-current window.
+--- Cancelling the debounce timer and pending sweeps also keeps a later
+--- callback from re-creating images for the unloaded buffer.
+local function clear_buffer_state(buf)
+	local timer = module.private.timers[buf]
+	if timer then
+		timer:stop()
+		timer:close()
+		module.private.timers[buf] = nil
+	end
+	reposition_pending[buf] = nil
+	reposition_preferred[buf] = nil
+	deep_redraw_pending[buf] = nil
+
+	for _, entry in pairs(module.private.blocks[buf] or {}) do
+		clear_image(entry)
+	end
+	module.private.blocks[buf] = nil
+
+	for _, entry in pairs(module.private.inlines[buf] or {}) do
+		clear_inline_entry(buf, entry)
+	end
+	module.private.inlines[buf] = nil
+end
+
 local function colorscheme_changed()
 	-- Aligned with core.latex.renderer: drop every cached conversion, then
 	-- recompute the foreground and re-render on the next tick, once the new
@@ -2467,6 +2496,25 @@ module.load = function()
 					schedule_render(buf, 0)
 				end
 			end
+		end,
+	})
+
+	-- `:bd`, `:bunload` and `:bwipeout` all fire BufUnload. Folded block
+	-- images are rendered detached (image.window = nil), so image.nvim's own
+	-- auto-cleanup cannot reach them, and no BufLeave fires at all when the
+	-- buffer is only displayed in a non-current window. Drop the whole
+	-- per-buffer state here so no image can survive the buffer.
+	vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
+		group = aug,
+		callback = function(event)
+			local buf = event.buf
+			if not vim.api.nvim_buf_is_valid(buf) then
+				return
+			end
+			if module.private.blocks[buf] == nil and module.private.inlines[buf] == nil then
+				return
+			end
+			clear_buffer_state(buf)
 		end,
 	})
 

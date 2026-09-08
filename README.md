@@ -303,6 +303,10 @@ wrapped in `\[ ... \]`.
 - Images wiped by floating UI recover automatically when its window closes
   (`WinClosed`), including notification and Noice popups, or through a manual
   `doautocmd User NeorgMathRendererRedraw` / `public.redraw()`.
+- Unloading or deleting the buffer (`:bd`, `:bunload`, `:bwipeout`) clears
+  every image of that buffer, including folded block images that render
+  detached from any window, and drops its cached state; re-entering the
+  buffer renders it fresh.
 - The foreground color tracks `@norg.rendered.latex` (including its link
   target) and is re-resolved on `ColorScheme`, so formulas follow your
   colorscheme automatically.
@@ -321,6 +325,14 @@ coverage:
 
 ```bash
 nvim --headless -u NONE -l test/inline_layout.lua
+```
+
+A buffer-lifecycle regression test checks that `:bd`, `:bunload` and
+`:bwipeout` clear every image (including detached folded block images) and
+drop per-buffer state, using stubbed neorg/image.nvim modules:
+
+```bash
+nvim --headless -u NONE -l test/buffer_unload.lua
 ```
 
 `test/sample.norg` contains math blocks of every supported shape for manual
