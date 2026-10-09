@@ -453,27 +453,67 @@ local function apply_inline_box_geometry(img, geometry)
 	end
 end
 
---- Terminal rows the rendered block image occupies: prefer the height
---- reported by the last successful render, fall back to a pixel estimate.
---- Inline `scale` is intentionally not applied here; block sizing continues
---- to follow `fit_window` and the image's rendered geometry.
+--- Match image.nvim's native block sizing before rendering. Reservations
+--- cannot use the last rendered height: it can belong to a different cell
+--- density/window size, or be absent while a transform is pending. Absolute
+--- fold fallbacks also need these window caps, which detaching would bypass.
+--- Inline `scale` is deliberately unrelated to this calculation.
+local function block_image_dimensions(img, win)
+	local ok, width, height = pcall(function()
+		local term = require("image/utils/term").get_size()
+		if not term or not term.cell_width or not term.cell_height
+			or term.cell_width <= 0 or term.cell_height <= 0
+			or not img.image_width or not img.image_height
+		then
+			return nil
+		end
+		local options = img.global_state and img.global_state.options or {}
+		local factor = type(options.scale_factor) == "number" and options.scale_factor or 1
+		local columns = math.min(math.floor(img.image_width / term.cell_width * factor), term.screen_cols)
+		local rows = math.floor(img.image_height / term.cell_height * factor)
+		if not img.ignore_global_max_size then
+			if win and vim.api.nvim_win_is_valid(win) then
+				local offsets = { x = 0, y = 0 }
+				if vim.api.nvim_win_get_config(win).relative == "" then
+					offsets = require("image/utils/offsets").get_global_offsets(win)
+				end
+				local max_width = img.max_width_window_percentage or options.max_width_window_percentage
+				local max_height = img.max_height_window_percentage or options.max_height_window_percentage
+				if type(max_width) == "number" then
+					columns = math.min(columns, math.floor((vim.api.nvim_win_get_width(win) - offsets.x) * max_width / 100))
+				end
+				if type(max_height) == "number" then
+					rows = math.min(rows, math.floor((vim.api.nvim_win_get_height(win) - offsets.y) * max_height / 100))
+				end
+			end
+			if type(options.max_width) == "number" then
+				columns = math.min(columns, options.max_width)
+			end
+			if type(options.max_height) == "number" then
+				rows = math.min(rows, options.max_height)
+			end
+		end
+		return require("image/utils/math").adjust_to_aspect_ratio(
+			term, img.image_width, img.image_height, columns, rows
+		)
+	end)
+	if ok and type(width) == "number" and type(height) == "number" and width > 0 and height > 0 then
+		return width, height
+	end
+	return nil
+end
+
 local function image_rows(img)
-	local ok, rendered = pcall(function()
-		return img.rendered_geometry and img.rendered_geometry.height
-	end)
-	if ok and type(rendered) == "number" and rendered > 0 then
-		return math.max(1, math.floor(rendered))
-	end
-	local ok_term, term = pcall(function()
-		return require("image/utils/term").get_size()
-	end)
-	local ok_px, px = pcall(function()
-		return img.image_height
-	end)
-	if ok_term and ok_px and term and term.cell_height and term.cell_height > 0 and px and px > 0 then
-		return math.max(1, math.floor(px / term.cell_height))
-	end
-	return 1
+	local _, height = block_image_dimensions(img, img.math_renderer_window or img.window)
+	return height and math.max(1, math.floor(height)) or 1
+end
+
+--- image.nvim's native focus/tmux handlers suspend its decoration provider,
+--- not Image:render(). Respect that state in our own sweeps and asynchronous
+--- transform callbacks too, so neither can repaint an inactive tmux window.
+local function image_render_inactive(img)
+	local state = img.global_state
+	return state and (state.enabled == false or state.disable_decorator_handling)
 end
 
 --- Check buffer row/column before passing it to image.nvim. image.nvim calls
@@ -511,12 +551,27 @@ end
 --- module's render passes. image.nvim calls `image:render()` later without
 --- going through our entry functions, so stale geometry must be rejected at
 --- the image-object boundary too.
-local function guard_image_render(buf, img)
+local render_entry_image
+local function guard_image_render(buf, img, entry, win)
 	if not img or img.math_renderer_render_guarded or type(img.render) ~= "function" then
 		return
 	end
 	local render = img.render
+	if entry then
+		img.math_renderer_native_render = render
+	end
 	img.render = function(self, geometry)
+		if entry then
+			-- Native scroll/focus/transform callbacks must refresh folded
+			-- coordinates too, rather than reuse an old absolute placement.
+			return render_entry_image(buf, entry, win, self, true)
+		end
+		if image_render_inactive(self) then
+			pcall(function()
+				self:clear(true)
+			end)
+			return
+		end
 		if self.buffer == buf and not self.math_renderer_absolute then
 			local row = geometry and geometry.y or self.geometry and self.geometry.y
 			local col = geometry and geometry.x or self.geometry and self.geometry.x
@@ -563,31 +618,37 @@ end
 
 --- Choose the visible image/window used for the buffer-wide reservation.
 --- Virtual lines are buffer-scoped, so different fold states in different
---- windows cannot have independent reservation anchors; prefer the current
---- window, then any non-hidden image.
+--- windows cannot have independent reservation anchors. Prefer the selected
+--- driver when still eligible, then the current window or any non-hidden image.
 local function reservation_window(buf, entry, preferred_win)
-	local current = preferred_win or vim.api.nvim_get_current_win()
+	local current = vim.api.nvim_get_current_win()
+	if preferred_win and entry.images[preferred_win] and vim.api.nvim_win_is_valid(preferred_win)
+		and vim.api.nvim_win_get_buf(preferred_win) == buf
+		and not fold_hides_image(entry_fold_info(entry, preferred_win))
+	then
+		current = preferred_win
+	end
 	local fallback
 	for win in pairs(entry.images) do
-		local folded = entry_fold_info(entry, win)
-		if not fold_hides_image(folded) then
-			fallback = fallback or win
-			if win == current then
-				return win
+		if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+			local folded = entry_fold_info(entry, win)
+			if not fold_hides_image(folded) then
+				fallback = fallback or win
+				if win == current then
+					return win
+				end
 			end
 		end
 	end
 	return fallback
 end
 
---- Return image/reservation coordinates for one window. Folded blocks use
---- the visible fold-summary row as the image anchor, so `screenpos` can
---- resolve the block indentation even when the row after/before the fold is
---- empty or shorter than that indentation. The reservation itself remains
---- outside the fold:
---- below -> above the next visible row, above -> below the previous visible
---- row. At a file edge with no outside anchor, the image covers the fold
---- summary and there is no following text for it to overlap.
+--- Return image/reservation coordinates for one window. Folded coordinates
+--- describe placement relative to the visible summary row; rendering can use
+--- an equivalent outside-fold buffer anchor or the absolute fallback. The
+--- reservation remains outside the fold: below -> above the next visible
+--- row, above -> below the previous visible row. At a file edge without an
+--- outside reservation anchor, the cached image is still kept.
 local function image_placement(buf, entry, win, rows)
 	local folded = entry_fold_info(entry, win)
 	local position = module.config.public.position
@@ -599,7 +660,6 @@ local function image_placement(buf, entry, win, rows)
 				reservation_above = true,
 				offset = -(rows + 1),
 				folded = false,
-				detach_buffer = false,
 			}
 		end
 		return {
@@ -608,7 +668,6 @@ local function image_placement(buf, entry, win, rows)
 			reservation_above = false,
 			offset = 0,
 			folded = false,
-			detach_buffer = false,
 		}
 	end
 
@@ -625,7 +684,6 @@ local function image_placement(buf, entry, win, rows)
 				reservation_above = true,
 				offset = 0,
 				folded = true,
-				detach_buffer = true,
 			}
 		end
 		return {
@@ -634,7 +692,6 @@ local function image_placement(buf, entry, win, rows)
 			reservation_above = false,
 			offset = 0,
 			folded = true,
-			detach_buffer = true,
 		}
 	end
 
@@ -647,7 +704,6 @@ local function image_placement(buf, entry, win, rows)
 			reservation_above = false,
 			offset = -(rows + 1),
 			folded = true,
-			detach_buffer = true,
 		}
 	end
 	-- There is no row before a fold at the top of the buffer. Prefer a
@@ -659,7 +715,6 @@ local function image_placement(buf, entry, win, rows)
 			reservation_above = true,
 			offset = 0,
 			folded = true,
-			detach_buffer = true,
 		}
 	end
 	return {
@@ -668,7 +723,6 @@ local function image_placement(buf, entry, win, rows)
 		reservation_above = false,
 		offset = 0,
 		folded = true,
-		detach_buffer = true,
 	}
 end
 
@@ -677,6 +731,9 @@ end
 --- anchor moves outside the fold so virtual lines remain visible.
 local function update_reservation(buf, entry, preferred_win)
 	local chosen_win = reservation_window(buf, entry, preferred_win)
+	-- Native callbacks can run in a different current window. Retain the
+	-- selected fold-state driver even when the reservation extmark is unchanged.
+	entry.reservation_win = chosen_win
 	local old_key = entry.reservation_key
 	local old_id = entry.reservation_id
 	local old_rows = entry.reservation_rows
@@ -757,10 +814,40 @@ local function screen_position(win, row, col)
 	return position
 end
 
---- Folded images are rendered with an absolute screen position because their
---- buffer row is inside a closed fold. Keep their bottom edge inside the
---- window content area; image.nvim cannot crop detached images to the window
---- and would otherwise paint over the statusline.
+--- Prefer a legal outside-fold buffer anchor when it preserves indentation.
+--- image.nvim clamps screenpos columns past EOL (and foldtext ignores them),
+--- so a short/empty adjacent row cannot anchor an indented image. Those cases
+--- retain the absolute fallback instead of shifting the formula to column 0.
+local function folded_buffer_anchor(buf, entry, win, placement, rows)
+	local row = placement.reservation_row
+	if row == nil or not buffer_position_valid(buf, row, entry.indent) then
+		return nil
+	end
+	local line = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
+	if not line:sub(1, entry.indent):match("^ *$") then
+		return nil
+	end
+	local ok, closed = pcall(vim.api.nvim_win_call, win, function()
+		return vim.fn.foldclosed(row + 1)
+	end)
+	if not ok or closed ~= -1 then
+		return nil
+	end
+	local offset = placement.reservation_above and -(rows + 1) or 0
+	local anchor_position = screen_position(win, row, entry.indent)
+	local summary_position = screen_position(win, placement.image_row, entry.indent)
+	if anchor_position and summary_position
+		and anchor_position.row + offset ~= summary_position.row + placement.offset
+	then
+		-- A wrapped preceding line (or another virtual-line reservation)
+		-- must not move an above-fold image onto that line's visible text.
+		return nil
+	end
+	return { row = row, offset = offset }
+end
+
+--- Absolute fallbacks cannot use image.nvim's native window crop. Keep their
+--- bottom edge inside the content area so they never paint over the statusline.
 local function image_fits_window_bottom(win, screen_row, rows)
 	local ok, info = pcall(function()
 		return vim.fn.getwininfo(win)[1]
@@ -778,32 +865,35 @@ local function image_fits_window_bottom(win, screen_row, rows)
 	return screen_row + rows <= winrow + height - 1
 end
 
---- Render one per-window image with current geometry. image.nvim normally
---- clears images whose buffer row is inside a fold. A math block image is an
---- intentional exception: keep it visible at the collapsed block position.
---- Temporarily detaching `image.buffer` bypasses image.nvim's fold guard and
---- also keeps its decoration provider from trying to clear this image while
---- the fold remains closed. The association is restored when the fold opens.
----
---- image.nvim's conceal-column correction expects a buffer whenever the
---- window conceallevel is >= 2, even though this module no longer conceals
---- source text. Temporarily lower that window-local option for the folded
---- render only, then restore the user's value.
-local function render_entry_image(buf, entry, win, img)
-	if not buffer_position_valid(buf, entry.math_row) then
+--- Render with native window sizing/clipping whenever an outside-fold
+--- buffer anchor is usable. Entire-buffer folds and short adjacent lines
+--- retain absolute placement, but use the same current cell/window sizing as
+--- unfolded images. Native callbacks enter here too through the render guard.
+render_entry_image = function(buf, entry, win, img, refresh_reservation)
+	if image_render_inactive(img) or not entry.shown or entry.images[win] ~= img
+		or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf
+		or not vim.api.nvim_buf_is_loaded(buf) or not buffer_position_valid(buf, entry.math_row)
+	then
 		pcall(function()
 			img:clear(true)
 		end)
 		return
 	end
+	if refresh_reservation then
+		update_reservation(buf, entry, entry.reservation_win)
+	end
+
+	img.window = win
+	img.inline = img.math_renderer_inline
+	img.buffer = buf
+	img.math_renderer_absolute = false
+	-- An absolute fallback supplies explicit dimensions. Native rendering
+	-- must infer them afresh after returning to a buffer/window anchor.
+	img.geometry.width = nil
+	img.geometry.height = nil
+
 	local fold = entry_fold_info(entry, win)
 	if fold_hides_image(fold) then
-		if img.math_renderer_absolute then
-			img.window = img.math_renderer_window
-			img.inline = img.math_renderer_inline
-			img.math_renderer_absolute = false
-		end
-		img.buffer = buf
 		if not img.hidden_by_fold then
 			pcall(function()
 				img:clear()
@@ -826,56 +916,44 @@ local function render_entry_image(buf, entry, win, img)
 		return
 	end
 
+	local render = img.math_renderer_native_render or img.render
 	if placement.folded then
+		local anchor = folded_buffer_anchor(buf, entry, win, placement, rows)
+		if anchor then
+			img.render_offset_top = anchor.offset
+			pcall(render, img, { x = entry.indent, y = anchor.row })
+			return
+		end
+
+		local width, height = block_image_dimensions(img, win)
 		local position = screen_position(win, placement.image_row, entry.indent)
 		local image_screen_row = position and position.row + placement.offset
-		if not position or not image_fits_window_bottom(win, image_screen_row, image_rows(img)) then
-			-- The folded anchor is outside the viewport or the image would cross
-			-- the window's bottom edge. Clear the old absolute placement;
-			-- otherwise it stays painted at its previous screen row and overlaps
-			-- whatever has scrolled into view or the statusline. Keep the image
-			-- object in entry.images so it can render again when it fits.
+		if not width or not position or not image_fits_window_bottom(win, image_screen_row, height) then
+			-- Clear the previous placement when its anchor leaves the viewport
+			-- or it would overlap the statusline. Reuse the object on return.
 			pcall(function()
 				img:clear(true)
 			end)
 			return
 		end
-		if not img.math_renderer_absolute then
-			img.math_renderer_window = img.window or win
-			img.math_renderer_inline = img.inline
-			img.math_renderer_absolute = true
-		end
+		img.math_renderer_absolute = true
 		img.window = nil
 		img.inline = false
-		img.buffer = buf
 		img.render_offset_top = 0
-		-- screenpos() reports the fold summary's foldtext column, not the
-		-- hidden source line's indentation. Use the same absolute x formula
-		-- image.nvim uses for its out-of-bounds fallback.
+		-- Foldtext does not expose the source indentation through screenpos.
 		local info = vim.fn.getwininfo(win)[1]
-		local absolute_x = position.col - 1
-		if info then
-			absolute_x = info.wincol - 1 + (info.textoff or 0) + entry.indent
-		end
-		pcall(function()
-			img:render({
-				x = absolute_x,
-				y = position.row + placement.offset,
-			})
-		end)
+		local absolute_x = info.wincol - 1 + (info.textoff or 0) + entry.indent
+		pcall(render, img, {
+			x = absolute_x,
+			y = image_screen_row,
+			width = width,
+			height = height,
+		})
 		return
 	end
 
-	if img.math_renderer_absolute then
-		img.window = img.math_renderer_window or win
-		img.inline = img.math_renderer_inline
-		img.math_renderer_absolute = false
-	end
-	img.buffer = buf
 	img.render_offset_top = placement.offset
-	pcall(function()
-		img:render({ x = entry.indent, y = placement.image_row })
-	end)
+	pcall(render, img, { x = entry.indent, y = placement.image_row })
 end
 
 local function create_image(buf, entry, win)
@@ -904,7 +982,9 @@ local function create_image(buf, entry, win)
 	})
 	if ok and img then
 		entry.images[win] = img
-		guard_image_render(buf, img)
+		img.math_renderer_window = win
+		img.math_renderer_inline = img.inline
+		guard_image_render(buf, img, entry, win)
 		-- Cloned image.nvim objects inherit caps from their source object;
 		-- overwrite them so each block keeps its configured fit behavior.
 		local max_percentage = module.config.public.fit_window and 100 or 100000
@@ -1296,7 +1376,7 @@ end
 --- Compute one image.nvim-compatible inline placeholder for an inline source
 --- span. All box widths use the same explicit conceal + inline replacement so
 --- later image anchors can be corrected from the conceal extmark.
-local function inline_layout_plan(buf, entry, box)
+local function inline_layout_plan(_, entry, box)
 	local range = entry.range
 	if range[1] ~= range[3] or not box or box.width_cells <= 0 then
 		return nil
@@ -2479,6 +2559,9 @@ module.load = function()
 	vim.api.nvim_create_autocmd("VimResized", {
 		group = aug,
 		callback = function()
+			for buf in pairs(module.private.blocks) do
+				schedule_reposition(buf)
+			end
 			for buf, state in pairs(module.private.inlines) do
 				for _, entry in pairs(state) do
 					entry.box_png = nil
@@ -2491,7 +2574,7 @@ module.load = function()
 					clear_inline_extmark(buf, entry)
 				end
 			end
-			for buf, state in pairs(module.private.inlines) do
+			for buf in pairs(module.private.inlines) do
 				if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].ft == "norg" then
 					schedule_render(buf, 0)
 				end
@@ -2499,8 +2582,19 @@ module.load = function()
 		end,
 	})
 
-	-- `:bd`, `:bunload` and `:bwipeout` all fire BufUnload. Folded block
-	-- images are rendered detached (image.window = nil), so image.nvim's own
+	-- Native window-resize handling cannot reach absolute fold fallbacks.
+	-- Refresh all block reservations and images without regenerating PNGs.
+	vim.api.nvim_create_autocmd("WinResized", {
+		group = aug,
+		callback = function()
+			for buf in pairs(module.private.blocks) do
+				schedule_reposition(buf)
+			end
+		end,
+	})
+
+	-- `:bd`, `:bunload` and `:bwipeout` all fire BufUnload. Some folded block
+	-- images use absolute fallbacks (image.window = nil), so image.nvim's own
 	-- auto-cleanup cannot reach them, and no BufLeave fires at all when the
 	-- buffer is only displayed in a non-current window. Drop the whole
 	-- per-buffer state here so no image can survive the buffer.
@@ -2518,10 +2612,8 @@ module.load = function()
 		end,
 	})
 
-	-- Folded images temporarily detach their buffer association to bypass
-	-- image.nvim's fold guard. Clean them explicitly when a window leaves the
-	-- buffer, because image.nvim cannot perform its normal buffer-mismatch
-	-- cleanup while that association is detached.
+	-- Synchronize all image/window associations after a buffer switch,
+	-- including absolute fold fallbacks without native window cleanup.
 	vim.api.nvim_create_autocmd("BufLeave", {
 		group = aug,
 		callback = function(event)

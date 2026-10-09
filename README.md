@@ -91,6 +91,13 @@ In a norg buffer:
 Images appear as soon as backend conversion finishes. Block source stays
 visible; inline source follows `conceal` and remains editable on its cursor row.
 
+For tmux visibility, enable `tmux_show_only_in_active_window = true` in your
+existing image.nvim setup. Use tmux >= 3.3 with `allow-passthrough on`,
+`visual-activity off`, and `focus-events on`, as required by image.nvim.
+Folded images respect image.nvim's native inactive/focus state, including
+pending transforms; this module does not override image.nvim's visibility
+options.
+
 The renderer refreshes images after Ctrl-L and common UI lifecycle redraws. For
 plugins that repaint the terminal directly without such an event, trigger the
 manual hook after repainting:
@@ -303,10 +310,19 @@ wrapped in `\[ ... \]`.
 - Images wiped by floating UI recover automatically when its window closes
   (`WinClosed`), including notification and Noice popups, or through a manual
   `doautocmd User NeorgMathRendererRedraw` / `public.redraw()`.
+- Folded blocks use outside-fold buffer/window anchors when the adjacent
+  line preserves their indentation and placement, retaining image.nvim's native
+  clipping. Short/wrapped adjacent lines and entire-buffer folds retain
+  absolute placement.
+  These fallbacks use the same terminal-cell sizing, `scale_factor`, and
+  native window/global caps as unfolded blocks. Their bottom edge must fit
+  above the statusline; full native window clipping is unavailable in this
+  fallback mode. Resizing refreshes block geometry and reservations without
+  reconverting LaTeX. Cell density comes from image.nvim's terminal geometry,
+  not a hardcoded Retina/non-Retina DPI ratio.
 - Unloading or deleting the buffer (`:bd`, `:bunload`, `:bwipeout`) clears
-  every image of that buffer, including folded block images that render
-  detached from any window, and drops its cached state; re-entering the
-  buffer renders it fresh.
+  every image of that buffer, including absolute folded fallbacks, and drops
+  its cached state; re-entering the buffer renders it fresh.
 - The foreground color tracks `@norg.rendered.latex` (including its link
   target) and is re-resolved on `ColorScheme`, so formulas follow your
   colorscheme automatically.
@@ -335,8 +351,37 @@ drop per-buffer state, using stubbed neorg/image.nvim modules:
 nvim --headless -u NONE -l test/buffer_unload.lua
 ```
 
-`test/sample.norg` contains math blocks of every supported shape for manual
-verification in a real neorg session.
+A folded lifecycle/geometry regression uses an installed image.nvim checkout's
+actual renderer, image objects, and native focus handlers with real Neovim
+folds/extmarks. Tmux queries, terminal geometry, PNG processing, and graphics
+output are controlled doubles:
+
+```bash
+nvim --headless -u NONE -l test/folded_lifecycle.lua
+# For a checkout outside stdpath("data")/lazy/image.nvim:
+IMAGE_NVIM_PATH=/path/to/image.nvim nvim --headless -u NONE -l test/folded_lifecycle.lua
+```
+
+These headless checks do **not** verify live terminal graphics, tmux switching,
+or physical display DPI. `test/sample.norg` provides formulas for live checks:
+
+1. With the tmux settings above and `hide_on_fold = false`, fold an indented
+   math block with a blank adjacent line, then one with an equally indented
+   adjacent line. Check `position = "below"` and `"above"`: placement and
+   formula size must match unfolded rendering. Also fold a buffer containing
+   only one math block; its formula must remain visible when it fits.
+2. Switch tmux windows/sessions away and back, including while conversion is
+   pending. No formula should remain painted on the other window; returning
+   should restore it. Scroll offscreen/back and near the statusline, and resize
+   Neovim splits; reservations and placement must follow without new LaTeX
+   conversions.
+3. Move the terminal between Retina/non-Retina displays or change its font,
+   then resize it so image.nvim refreshes terminal geometry. Inspect
+   `require("image/utils/term").get_size()` in Neovim and compare folded versus
+   unfolded formula size and reserved rows at both densities. If the terminal
+   does not report updated pixel geometry, this module cannot infer screen DPI.
+4. Verify `hide_on_fold = true`, an outer section fold, and `:bd`/`:bunload`/
+   `:bwipeout` (including a non-current split) still clear the appropriate images.
 
 ## Troubleshooting
 
