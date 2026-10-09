@@ -315,9 +315,14 @@ wrapped in `\[ ... \]`.
   clipping. Short/wrapped adjacent lines and entire-buffer folds retain
   absolute placement.
   These fallbacks use the same terminal-cell sizing, `scale_factor`, and
-  native window/global caps as unfolded blocks. Their bottom edge must fit
-  above the statusline; full native window clipping is unavailable in this
-  fallback mode. Resizing refreshes block geometry and reservations without
+  native window/global caps as unfolded blocks. With image.nvim's `kitty`
+  backend using normal placements (not `unicode-placeholders`), folded images
+  are cropped at all content-window edges, including absolute fallbacks. The
+  original image size, source PNG and reserved rows are retained; scrolling
+  or resizing back restores the full image. Fully offscreen images clear.
+  Other backends retain their previous clipping behavior: absolute fallbacks
+  hide when their bottom edge cannot fit above the statusline.
+  Resizing refreshes block geometry and reservations without
   reconverting LaTeX. Cell density comes from image.nvim's terminal geometry,
   not a hardcoded Retina/non-Retina DPI ratio.
 - Unloading or deleting the buffer (`:bd`, `:bunload`, `:bwipeout`) clears
@@ -369,7 +374,10 @@ or physical display DPI. `test/sample.norg` provides formulas for live checks:
    math block with a blank adjacent line, then one with an equally indented
    adjacent line. Check `position = "below"` and `"above"`: placement and
    formula size must match unfolded rendering. Also fold a buffer containing
-   only one math block; its formula must remain visible when it fits.
+   only one math block; its formula must remain visible. With normal Kitty
+   placements, scroll/resize it across top, bottom and horizontal split edges:
+   only the out-of-window portion should disappear, without shrinking or
+   painting over statuslines/borders, and returning should restore it.
 2. Switch tmux windows/sessions away and back, including while conversion is
    pending. No formula should remain painted on the other window; returning
    should restore it. Scroll offscreen/back and near the statusline, and resize

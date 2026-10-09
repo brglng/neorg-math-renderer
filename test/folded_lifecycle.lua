@@ -18,7 +18,10 @@ local function check(name, condition)
 end
 
 local term = { screen_cols = 80, screen_rows = 24, cell_width = 20, cell_height = 40 }
-package.loaded["image/utils/term"] = { get_size = function() return term end }
+package.loaded["image/utils/term"] = {
+	get_size = function() return term end,
+	get_tty = function() return "/dev/null" end,
+}
 local tmux_window, tmux_session = "@editor", "$editor"
 package.loaded["image/utils/tmux"] = {
 	is_tmux = true,
@@ -81,6 +84,16 @@ image.setup({
 })
 local state = assert(image.from_file(png)).global_state
 local paints, clears = 0, 0
+package.loaded["image/backends/kitty/helpers"] = {
+	write_graphics = function() end,
+	restore_cursor = function() end,
+	write_placeholder = function() end,
+	write_graphics_at = function(payload, x, y)
+		state.last_display = { payload = vim.deepcopy(payload), x = x - 1, y = y - 1 }
+	end,
+}
+local kitty = require("image/backends/kitty")
+kitty.state = state
 state.backend = {
 	features = { crop = true },
 	render = function(img, x, y, width, height)
@@ -88,6 +101,10 @@ state.backend = {
 		state.images[img.id] = img
 		img.is_rendered = true
 		img.last_paint = { x = x, y = y, width = width, height = height }
+		-- Exercise Kitty's actual source-pixel crop payload with graphics I/O
+		-- stubbed, rather than assuming the requested bounds imply clipping.
+		kitty.render(img, x, y, width, height)
+		img.last_display = vim.deepcopy(state.last_display)
 	end,
 	clear = function(id, shallow)
 		clears = clears + 1
@@ -224,14 +241,14 @@ end)
 check("window resize completes both split renders", resize_ready)
 img = assert(entry.images[win])
 local wider_img = assert(entry.images[wider_win])
-check("folded fallback honors native fit_window caps", img.last_paint.width == 30 and img.last_paint.height == 5)
-check("wider split retains its native image height", wider_img.last_paint.width == 48 and wider_img.last_paint.height == 8)
-local max_height = math.max(img.last_paint.height, wider_img.last_paint.height)
+check("folded fallback honors native fit_window caps", img.rendered_geometry.width == 30 and img.rendered_geometry.height == 5)
+check("wider split retains its native image height", wider_img.rendered_geometry.width == 48 and wider_img.rendered_geometry.height == 8)
+local max_height = math.max(img.rendered_geometry.height, wider_img.rendered_geometry.height)
 check("window resize refreshes reservations", reservation_height(buf, entry) == max_height
 	and entry.reservation_rows == max_height and max_height == 8)
 check("window resize preserves chosen fold driver and outside anchor", entry.reservation_win == win
 	and entry.reservation_row == 4 and entry.reservation_above)
-local capped_width, capped_height = img.last_paint.width, img.last_paint.height
+local capped_width, capped_height = img.rendered_geometry.width, img.rendered_geometry.height
 vim.cmd("normal! zR")
 refresh(buf)
 check("window-capped folded/unfolded sizes agree", img.last_paint.width == capped_width and img.last_paint.height == capped_height)
@@ -304,6 +321,152 @@ for _, position in ipairs({ "below", "above" }) do
 	refresh(buf)
 	check(position .. " outer fold always hides image and reservation", not img.is_rendered and reservation_height(buf, entry) == 0)
 end
+
+-- A real nowrap native anchor can lose its source column to horizontal
+-- scrolling while part of the image remains visible. Resolve the vertical
+-- position from visible text, but crop from the original scrolled origin.
+term.cell_width, term.cell_height = 20, 40
+vim.wo.wrap = false
+for _, position in ipairs({ "below", "above" }) do
+	local adjacent = "    " .. string.rep("TEXT", 40)
+	buf, win, entry, img = seed({ adjacent, "    @math", "    x^2", "    @end", adjacent, "NEXT" }, 1, 3, 4, position, false)
+	close_fold(buf, entry)
+	local anchor_row = position == "below" and 5 or 1
+	local full_y = img.last_paint.y
+	local reservation_id = entry.reservation_id
+	local horizontal_transforms = transforms
+	check(position .. " horizontal regression starts with native anchor", img.is_rendered
+		and not img.math_renderer_absolute and img.rendered_geometry.width == 24 and img.rendered_geometry.height == 4)
+	vim.fn.winrestview({ topline = 1, lnum = 1, col = 20, leftcol = 10 })
+	refresh(buf)
+	local info = vim.fn.getwininfo(win)[1]
+	check(position .. " horizontal scroll naturally hides native anchor column", vim.fn.winsaveview().leftcol == 10
+		and vim.fn.screenpos(win, anchor_row, 5).row == 0)
+	check(position .. " horizontal partial crop retains true source origin", img.is_rendered and img.math_renderer_absolute
+		and img.last_display.x == info.wincol - 1 + (info.textoff or 0)
+		and img.last_display.y == full_y and img.last_display.payload.display_x == 120
+		and img.last_display.payload.display_width == 360 and img.last_display.payload.display_height == 160)
+	check(position .. " horizontal crop preserves dimensions and reservation", img.rendered_geometry.width == 24
+		and img.rendered_geometry.height == 4 and entry.reservation_id == reservation_id
+		and reservation_height(buf, entry) == 4 and entry.png == png)
+	vim.fn.winrestview({ topline = 1, lnum = 1, col = 30, leftcol = 16 })
+	img:render()
+	settle()
+	check(position .. " horizontal callback refreshes crop", img.is_rendered
+		and img.last_display.payload.display_x == 240 and img.last_display.payload.display_width == 240
+		and img.last_display.y == full_y)
+	vim.fn.winrestview({ topline = 1, lnum = 1, col = 40, leftcol = 30 })
+	img:render()
+	settle()
+	check(position .. " horizontal fully offscreen callback clears image", not img.is_rendered and entry.images[win] == img)
+	refresh(buf)
+	check(position .. " horizontal fully offscreen sweep stays cleared", not img.is_rendered)
+	vim.fn.winrestview({ topline = 1, lnum = 1, col = 20, leftcol = 10 })
+	img:render()
+	settle()
+	check(position .. " horizontal callback return restores partial source", img.is_rendered
+		and entry.images[win] == img and img.last_display.payload.display_x == 120
+		and img.last_display.payload.display_width == 360)
+	vim.fn.winrestview({ topline = 1, lnum = 1, col = 0, leftcol = 0 })
+	refresh(buf)
+	check(position .. " horizontal scroll return restores native binding and full source", img.is_rendered
+		and entry.images[win] == img and img.window == win and img.buffer == buf and img.inline
+		and not img.math_renderer_absolute and img.geometry.width == nil and img.geometry.height == nil
+		and img.last_display.x == info.wincol - 1 + (info.textoff or 0) + 4 and img.last_display.y == full_y
+		and img.last_display.payload.display_x == 0 and img.last_display.payload.display_width == 480
+		and img.last_display.payload.display_height == 160 and transforms == horizontal_transforms)
+end
+-- Legal short anchors have no visible character at leftcol=10. Keep a long
+-- cursor line elsewhere so Neovim naturally retains horizontal scrolling.
+-- A winbar and an unrelated virtual reservation exercise real vertical layout.
+for _, position in ipairs({ "below", "above" }) do
+	local short, long = "    A", "    " .. string.rep("TEXT", 40)
+	buf, win, entry, img = seed({ "PRECEDING", short, "    @math", "    x^2", "    @end", short, long },
+		2, 4, 4, position, false)
+	vim.wo.winbar = "Layout regression"
+	local extra_ns = vim.api.nvim_create_namespace("short-anchor-layout")
+	vim.api.nvim_buf_set_extmark(buf, extra_ns, 0, 0, {
+		virt_lines = { { { "", "" } }, { { "", "" } }, { { "", "" } } },
+	})
+	close_fold(buf, entry)
+	local anchor_row = position == "below" and 6 or 2
+	local full_y, reservation_id = img.last_paint.y, entry.reservation_id
+	local horizontal_transforms = transforms
+	check(position .. " short anchor starts native with full sizing", img.is_rendered
+		and not img.math_renderer_absolute and img.rendered_geometry.width == 24
+		and img.rendered_geometry.height == 4 and reservation_height(buf, entry) == 4)
+	vim.api.nvim_win_set_cursor(win, { 7, 20 })
+	vim.fn.winrestview({ topline = 1, lnum = 7, col = 20, leftcol = 10 })
+	refresh(buf)
+	local info = vim.fn.getwininfo(win)[1]
+	local view = vim.fn.winsaveview()
+	check(position .. " short anchor naturally has no visible character", view.leftcol == 10
+		and vim.fn.virtcol2col(win, anchor_row, 11) == 5 and vim.fn.screenpos(win, anchor_row, 5).row == 0)
+	check(position .. " short anchor partial crop keeps vertical layout and source", img.is_rendered
+		and img.math_renderer_absolute and img.last_paint.x == info.wincol - 1 + (info.textoff or 0) - 6
+		and img.last_display.y == full_y and img.last_display.payload.display_x == 120
+		and img.last_display.payload.display_width == 360 and img.last_display.payload.display_height == 160)
+	img:render()
+	settle()
+	check(position .. " short anchor callback has no viewport side effects", img.is_rendered
+		and img.last_display.y == full_y and vim.deep_equal(vim.fn.winsaveview(), view))
+	vim.fn.winrestview({ topline = 1, lnum = 7, col = 30, leftcol = 16 })
+	img:render()
+	settle()
+	check(position .. " short anchor callback refreshes partial crop", img.is_rendered
+		and img.last_display.y == full_y and img.last_display.payload.display_x == 240
+		and img.last_display.payload.display_width == 240)
+	vim.fn.winrestview({ topline = 1, lnum = 7, col = 40, leftcol = 30 })
+	img:render()
+	settle()
+	check(position .. " short anchor fully offscreen callback clears", not img.is_rendered and entry.images[win] == img)
+	refresh(buf)
+	check(position .. " short anchor fully offscreen sweep stays cleared", not img.is_rendered)
+	vim.fn.winrestview({ topline = 1, lnum = 7, col = 20, leftcol = 10 })
+	img:render()
+	settle()
+	check(position .. " short anchor callback return reuses partial source", img.is_rendered
+		and entry.images[win] == img and img.last_display.y == full_y
+		and img.last_display.payload.display_x == 120 and img.last_display.payload.display_width == 360)
+	check(position .. " short anchor clipping preserves sizing and reservation", img.rendered_geometry.width == 24
+		and img.rendered_geometry.height == 4 and entry.reservation_id == reservation_id
+		and reservation_height(buf, entry) == 4 and entry.png == png and transforms == horizontal_transforms)
+	vim.fn.winrestview({ topline = 1, lnum = 7, col = 0, leftcol = 0 })
+	refresh(buf)
+	check(position .. " short anchor return restores native full source", img.is_rendered and entry.images[win] == img
+		and img.window == win and img.buffer == buf and img.inline and not img.math_renderer_absolute
+		and img.geometry.width == nil and img.geometry.height == nil and img.last_display.y == full_y
+		and img.last_display.payload.display_x == 0 and img.last_display.payload.display_width == 480
+		and img.last_display.payload.display_height == 160 and entry.reservation_id == reservation_id
+		and transforms == horizontal_transforms)
+	vim.fn.winrestview({ topline = position == "below" and 6 or 3, topfill = 2,
+		lnum = 7, col = 20, leftcol = 10 })
+	refresh(buf)
+	info = vim.fn.getwininfo(win)[1]
+	local content_top = info.winrow - 1 + (info.winbar or 0)
+	check(position .. " short anchor top crop excludes winbar", img.is_rendered
+		and info.winbar == 1 and img.last_display.y == content_top
+		and img.last_display.payload.display_y == 80 and img.last_display.payload.display_height == 80
+		and img.last_display.payload.display_x == 120 and img.last_display.payload.display_width == 360)
+	vim.wo.winbar = ""
+	vim.fn.winrestview({ topline = position == "below" and 6 or 3, topfill = 2,
+		lnum = 7, col = 20, leftcol = 10 })
+	refresh(buf)
+	check(position .. " short anchor combines horizontal crop with visible topfill", img.is_rendered
+		and vim.fn.winsaveview().topfill == 2 and img.last_paint.y == -2
+		and img.last_display.payload.display_x == 120 and img.last_display.payload.display_width == 360
+		and img.last_display.payload.display_y == 80 and img.last_display.payload.display_height == 80
+		and img.rendered_geometry.height == 4 and entry.reservation_id == reservation_id)
+	vim.fn.winrestview({ topline = 1, lnum = 7, col = 0, leftcol = 0 })
+	refresh(buf)
+	check(position .. " short anchor vertical return restores full native source", img.is_rendered
+		and not img.math_renderer_absolute and entry.images[win] == img
+		and img.last_display.payload.display_x == 0 and img.last_display.payload.display_y == 0
+		and img.last_display.payload.display_width == 480 and img.last_display.payload.display_height == 160
+		and transforms == horizontal_transforms and entry.reservation_id == reservation_id)
+end
+vim.wo.wrap = true
+term.cell_width, term.cell_height = 10, 20
 
 buf, win, entry, img = seed({ "    " .. string.rep("BEFORE ", 30), "    @math", "    x^2", "    @end", "NEXT" }, 1, 3, 4, "above")
 close_fold(buf, entry)
@@ -390,8 +553,8 @@ vim.api.nvim_set_current_win(win)
 refresh(buf)
 native_width, native_height = img.last_paint.width, img.last_paint.height
 close_fold(buf, entry)
-check("fit_window false retains native folded/unfolded size", img.last_paint.width == native_width
-	and img.last_paint.height == native_height and native_width == 48 and native_height == 8)
+check("fit_window false retains native folded/unfolded size", img.rendered_geometry.width == native_width
+	and img.rendered_geometry.height == native_height and native_width == 48 and native_height == 8)
 vim.cmd("only")
 settle()
 
@@ -409,16 +572,41 @@ vim.cmd("normal! zt")
 refresh(buf)
 check("scrolling back restores existing folded placement", img.is_rendered and entry.images[win] == img
 	and img.last_paint.x == 4 and img.last_paint.y == vim.fn.screenpos(win, 9, 1).row)
+vim.fn.winrestview({ topline = 12, topfill = 4, lnum = 12 })
+refresh(buf)
+check("partially scrolled reservation keeps fallback visible", img.is_rendered
+	and img.last_display.payload.display_y > 0
+	and img.last_display.payload.display_height < img.rendered_geometry.height * term.cell_height)
+vim.api.nvim_win_set_cursor(win, { 9, 0 })
+vim.cmd("normal! zt")
+refresh(buf)
+check("partial reservation scroll returns to full source", img.is_rendered
+	and img.last_display.payload.display_y == 0
+	and img.last_display.payload.display_height == img.rendered_geometry.height * term.cell_height)
 vim.cmd("normal! zb")
 refresh(buf)
 local win_info = vim.fn.getwininfo(win)[1]
 check("folded fallback stays above the statusline", img.is_rendered
 	and img.last_paint.y + img.last_paint.height <= win_info.winrow + win_info.height - 1)
 vim.cmd("split")
+module.config.public.fit_window = false
+img.max_width_window_percentage = 100000
+img.max_height_window_percentage = 100000
 vim.api.nvim_win_set_height(win, 5)
 vim.api.nvim_set_current_win(win)
 refresh(buf)
-check("folded fallback hides when it cannot fit above statusline", not img.is_rendered)
+check("folded fallback crops instead of hiding at statusline", img.is_rendered
+	and img.last_display.y + img.last_display.payload.display_height / term.cell_height
+		<= vim.fn.getwininfo(win)[1].winrow + vim.fn.getwininfo(win)[1].height - 1)
+check("bottom cropping retains full reservation and native dimensions", entry.reservation_rows >= img.rendered_geometry.height
+	and img.rendered_geometry.height > img.last_display.payload.display_height / term.cell_height and entry.png == png)
+local cropped_img = img
+vim.api.nvim_win_set_height(win, 12)
+vim.api.nvim_win_set_cursor(win, { 9, 0 })
+vim.cmd("normal! zt")
+refresh(buf)
+check("resize restores full fallback image without recreation", entry.images[win] == cropped_img
+	and img.last_display.payload.display_height == img.rendered_geometry.height * term.cell_height)
 vim.cmd("only")
 settle()
 
@@ -427,6 +615,160 @@ close_fold(buf, entry)
 check("entire-buffer fold preserves cached formula", img.is_rendered and img.math_renderer_absolute
 	and img.last_paint.x == 4 and img.last_paint.width == 48 and img.last_paint.height == 8)
 check("entire-buffer fold has no invalid reservation anchor", entry.reservation_id == nil and img.buffer == buf)
+
+-- Force source rectangles across every edge, including both vertical edges
+-- at once. Use the guarded native callback with controlled screenpos only;
+-- the real Kitty backend still constructs the final graphics payload.
+local original_screenpos = vim.fn.screenpos
+local forced_row = 1
+vim.fn.screenpos = function(target, row, col)
+	if target == win then return { row = forced_row, col = 5, endcol = 5, curscol = 5 } end
+	return original_screenpos(target, row, col)
+end
+local function assert_display_inside(name)
+	local info = vim.fn.getwininfo(win)[1]
+	local display = img.last_display
+	check(name, img.is_rendered and display.x >= info.wincol - 1
+		and display.y >= info.winrow - 1
+		and display.x + display.payload.display_width / term.cell_width <= info.wincol - 1 + info.width
+		and display.y + display.payload.display_height / term.cell_height <= info.winrow + info.height - 1)
+end
+forced_row = -2
+img:render()
+settle()
+assert_display_inside("entire-buffer fallback clips top via native callback")
+check("top clipping selects original lower source pixels", img.last_display.payload.display_y == 2 * term.cell_height
+	and img.last_display.payload.display_height == 6 * term.cell_height
+	and img.rendered_geometry.height == 8)
+forced_row = 1
+img:render()
+settle()
+check("native callback restores uncropped source", img.last_display.payload.display_y == 0
+	and img.last_display.payload.display_height == 8 * term.cell_height)
+vim.cmd("vsplit")
+vim.api.nvim_win_set_width(win, 20)
+module.config.public.fit_window = false
+img.max_width_window_percentage = 100000
+img.max_height_window_percentage = 100000
+img:render()
+settle()
+assert_display_inside("entire-buffer fallback clips right split edge")
+check("horizontal crop retains original width and reservation", img.rendered_geometry.width == 48
+	and entry.reservation_rows == 8 and img.last_display.payload.display_width == 16 * term.cell_width)
+vim.api.nvim_win_call(win, function()
+	local view = vim.fn.winsaveview()
+	view.leftcol = 10
+	vim.wo.wrap = false
+	vim.fn.winrestview(view)
+end)
+img:render()
+settle()
+assert_display_inside("fallback clips simultaneous left and right edges")
+check("left crop selects original source pixels without rescaling", img.last_display.payload.display_x == 6 * term.cell_width
+	and img.last_display.payload.display_width == 20 * term.cell_width
+	and img.rendered_geometry.width == 48)
+vim.api.nvim_set_current_win(win)
+vim.cmd("only")
+vim.api.nvim_win_call(win, function()
+	local view = vim.fn.winsaveview()
+	view.leftcol = 0
+	vim.fn.winrestview(view)
+end)
+vim.cmd("split")
+vim.api.nvim_win_set_height(win, 3)
+forced_row = vim.fn.getwininfo(win)[1].winrow - 3
+img:render()
+settle()
+assert_display_inside("fallback clips simultaneous top and bottom edges")
+check("two-edge crop preserves source offset and visible intersection", img.last_display.payload.display_y == 2 * term.cell_height
+	and img.last_display.payload.display_height == 3 * term.cell_height)
+forced_row = -20
+img:render()
+settle()
+check("fully offscreen callback clears existing image", not img.is_rendered)
+vim.api.nvim_set_current_win(win)
+vim.cmd("only")
+forced_row = vim.fn.getwininfo(win)[1].winrow
+-- WinClosed intentionally triggers a delayed deep redraw. Finish it before
+-- checking that an offscreen/return callback itself does not recreate images.
+vim.wait(150, function() return false end)
+img = assert(entry.images[win])
+forced_row = -20
+img:render()
+settle()
+forced_row = vim.fn.getwininfo(win)[1].winrow
+img:render()
+settle()
+check("return restores original full image object and source", img.is_rendered and entry.images[win] == img
+	and img.last_display.payload.display_width == 48 * term.cell_width
+	and img.last_display.payload.display_height == 8 * term.cell_height and entry.png == png)
+vim.fn.screenpos = original_screenpos
+
+-- Equivalent native outside-fold anchors pass through the same Kitty crop
+-- boundary, with no change to their buffer binding or render offset.
+for _, position in ipairs({ "below", "above" }) do
+	buf, win, entry, img = seed({ "    BEFORE", "    @math", "    x^2", "    @end", "    AFTER" }, 1, 3, 4, position, false)
+	close_fold(buf, entry)
+	check(position .. " clipping regression uses native anchor", not img.math_renderer_absolute)
+	forced_row = position == "above" and 6 or -2
+	vim.fn.screenpos = function(target, row, col)
+		if target == win then return { row = forced_row, col = 5, endcol = 5, curscol = 5 } end
+		return original_screenpos(target, row, col)
+	end
+	img:render()
+	settle()
+	assert_display_inside(position .. " native anchor clips top edge")
+	check(position .. " native top clip keeps full geometry", img.rendered_geometry.height == 8
+		and img.last_display.payload.display_y > 0)
+	forced_row = position == "above" and 29 or 20
+	img:render()
+	settle()
+	assert_display_inside(position .. " native anchor clips bottom edge")
+	check(position .. " native bottom clip keeps reservation", entry.reservation_rows == 8
+		and img.last_display.payload.display_height < 8 * term.cell_height)
+	vim.fn.screenpos = original_screenpos
+	img:render()
+	settle()
+	check(position .. " native callback restores source and binding", img.is_rendered and img.window == win
+		and img.buffer == buf and img.last_display.payload.display_height == 8 * term.cell_height)
+end
+
+-- A bordered float's getwininfo rectangle describes content, not its border.
+-- Entire-buffer folds must remain bounded even though the native image is
+-- detached from the window for absolute placement.
+buf, win, entry, img = seed({ "    @math", "    x^2", "    @end" }, 0, 2, 4, "below", false)
+local float_win = vim.api.nvim_open_win(buf, true, {
+	relative = "editor", row = 3, col = 10, width = 20, height = 3,
+	border = "single", style = "minimal",
+})
+win = float_win
+vim.wo.foldmethod = "manual"
+close_fold(buf, entry)
+img = assert(entry.images[win])
+assert_display_inside("entire-buffer fallback excludes floating borders")
+check("bordered float retains full source size", img.rendered_geometry.width == 48
+	and img.rendered_geometry.height == 8)
+vim.api.nvim_win_close(float_win, true)
+settle()
+
+-- Non-Kitty and unicode-placeholder backends are intentionally unchanged.
+for _, unsupported in ipairs({ "sixel", "unicode-placeholders" }) do
+	state.options.backend = unsupported == "sixel" and "sixel" or "kitty"
+	state.options.kitty_method = unsupported == "unicode-placeholders" and unsupported or "normal"
+	buf, win, entry, img = seed({ "    @math", "    x^2", "    @end" }, 0, 2, 4, "below", false)
+	close_fold(buf, entry)
+	vim.cmd("split")
+	vim.api.nvim_win_set_height(win, 3)
+	vim.api.nvim_set_current_win(win)
+	refresh(buf)
+	check(unsupported .. " retains fallback overflow guard", not img.is_rendered
+		and not img.math_renderer_clip_backend)
+	vim.cmd("only")
+end
+state.options.backend = "kitty"
+state.options.kitty_method = "normal"
+buf, win, entry, img = seed({ "    @math", "    x^2", "    @end" }, 0, 2, 4)
+close_fold(buf, entry)
 local old_img = img
 vim.cmd("bwipeout!")
 check("unload clears folded fallback and per-buffer state", not old_img.is_rendered and module.private.blocks[buf] == nil)

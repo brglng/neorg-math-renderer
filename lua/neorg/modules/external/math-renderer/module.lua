@@ -814,6 +814,27 @@ local function screen_position(win, row, col)
 	return position
 end
 
+--- Resolve a row's vertical origin even when nowrap horizontal scrolling
+--- hides every character on it. Neovim counts folds and virtual/diff filler;
+--- the viewport's topfill/skipcol and winbar locate that layout on screen.
+local function buffer_screen_row(win, row)
+	local ok, screen_row = pcall(vim.api.nvim_win_call, win, function()
+		local view = vim.fn.winsaveview()
+		local info = vim.fn.getwininfo(win)[1]
+		local top = view.topline - 1
+		local height = vim.api.nvim_win_text_height(win, {
+			start_row = math.min(top, row), start_vcol = 0,
+			end_row = math.max(top, row), end_vcol = 0,
+		}).all
+		local skipped = vim.api.nvim_win_text_height(win, {
+			start_row = top, start_vcol = 0, end_row = top, end_vcol = view.skipcol,
+		}).all
+		return info.winrow + (info.winbar or 0) + view.topfill - skipped
+			+ (row >= top and height or -height)
+	end)
+	return ok and screen_row or nil
+end
+
 --- Prefer a legal outside-fold buffer anchor when it preserves indentation.
 --- image.nvim clamps screenpos columns past EOL (and foldtext ignores them),
 --- so a short/empty adjacent row cannot anchor an indented image. Those cases
@@ -846,8 +867,7 @@ local function folded_buffer_anchor(buf, entry, win, placement, rows)
 	return { row = row, offset = offset }
 end
 
---- Absolute fallbacks cannot use image.nvim's native window crop. Keep their
---- bottom edge inside the content area so they never paint over the statusline.
+--- Unsupported backends retain the existing absolute-fallback safety guard.
 local function image_fits_window_bottom(win, screen_row, rows)
 	local ok, info = pcall(function()
 		return vim.fn.getwininfo(win)[1]
@@ -863,6 +883,69 @@ local function image_fits_window_bottom(win, screen_row, rows)
 	-- `screen_row` is the 1-based row returned by screenpos(), while the
 	-- detached image backend starts at its zero-based y plus one.
 	return screen_row + rows <= winrow + height - 1
+end
+
+--- Kitty's normal placement backend crops source pixels, not display size.
+--- Keep the native renderer/transform lifecycle, but bound folded placements
+--- to the actual content rectangle (excluding borders, statuslines and splits).
+--- Shorten only the backend's source rectangle on the right/bottom, then let
+--- Kitty crop the left/top. This also avoids its sequential two-edge crop
+--- calculations overwriting one another when an image spans both edges.
+local function folded_kitty_bounds(img, win)
+	local state = img.global_state
+	if not state or state.options.backend ~= "kitty" or not state.backend.features.crop
+		or state.options.kitty_method == "unicode-placeholders"
+	then
+		return nil
+	end
+	local info = vim.fn.getwininfo(win)[1]
+	if not info then
+		return nil
+	end
+	return {
+		left = info.wincol - 1 + (info.textoff or 0),
+		right = info.wincol - 1 + info.width,
+		top = info.winrow - 1 + (info.winbar or 0),
+		bottom = info.winrow + (info.winbar or 0) + info.height - 2,
+	}
+end
+
+local function install_folded_kitty_clip(img)
+	if img.math_renderer_clip_backend then
+		return
+	end
+	local state = img.global_state
+	local backend = state.backend
+	local clipped_backend = setmetatable({}, { __index = backend })
+	clipped_backend.render = function(image, x, y, width, height)
+		local bounds = image.math_renderer_clip_bounds
+		if not bounds then
+			return backend.render(image, x, y, width, height)
+		end
+		local right = math.min(x + width, bounds.right)
+		local bottom = math.min(y + height, bounds.bottom + 1)
+		if right <= math.max(x, bounds.left) or bottom <= math.max(y, bounds.top) then
+			image:clear(true)
+			return
+		end
+		local native_bounds = image.bounds
+		image.bounds = {
+			left = bounds.left,
+			top = bounds.top,
+			right = right,
+			-- The height supplied below already excludes bottom overflow.
+			bottom = math.max(y, bounds.top) + bottom - y,
+		}
+		local ok, err = pcall(backend.render, image, x, y, right - x, bottom - y)
+		image.bounds = native_bounds
+		if not ok then
+			error(err)
+		end
+	end
+	-- Read live focus/enabled state through the original state. Never replace
+	-- the shared backend or alter image.nvim's global configuration.
+	img.global_state = setmetatable({ backend = clipped_backend }, { __index = state })
+	img.math_renderer_clip_backend = true
 end
 
 --- Render with native window sizing/clipping whenever an outside-fold
@@ -916,10 +999,30 @@ render_entry_image = function(buf, entry, win, img, refresh_reservation)
 		return
 	end
 
+	local bounds = placement.folded and folded_kitty_bounds(img, win) or nil
+	if bounds then
+		install_folded_kitty_clip(img)
+	end
+	local clip_key = bounds and ("%d:%d:%d:%d"):format(bounds.left, bounds.top, bounds.right, bounds.bottom) or nil
+	if img.math_renderer_clip_key ~= clip_key then
+		-- image.nvim's geometry cache does not include changing window bounds.
+		img.rendered_geometry.x = nil
+	end
+	img.math_renderer_clip_key = clip_key
+	img.math_renderer_clip_bounds = bounds
+
 	local render = img.math_renderer_native_render or img.render
 	if placement.folded then
 		local anchor = folded_buffer_anchor(buf, entry, win, placement, rows)
-		if anchor then
+		local leftcol = bounds and vim.api.nvim_win_call(win, function()
+			return vim.fn.winsaveview().leftcol
+		end) or 0
+		-- image.nvim clears a native anchor whose column has scrolled away,
+		-- even when the image still intersects the window. Keep its original
+		-- scrolled origin through Kitty's absolute path in that case only.
+		local scrolled_anchor = bounds and anchor and leftcol > entry.indent
+			and not screen_position(win, anchor.row, entry.indent)
+		if anchor and not scrolled_anchor then
 			img.render_offset_top = anchor.offset
 			pcall(render, img, { x = entry.indent, y = anchor.row })
 			return
@@ -928,9 +1031,25 @@ render_entry_image = function(buf, entry, win, img, refresh_reservation)
 		local width, height = block_image_dimensions(img, win)
 		local position = screen_position(win, placement.image_row, entry.indent)
 		local image_screen_row = position and position.row + placement.offset
-		if not width or not position or not image_fits_window_bottom(win, image_screen_row, height) then
-			-- Clear the previous placement when its anchor leaves the viewport
-			-- or it would overlap the statusline. Reuse the object on return.
+		if scrolled_anchor then
+			-- A legal short anchor may have no horizontally visible character.
+			-- Recover its row from the window layout without moving the viewport
+			-- or using a different screen column as the image's source origin.
+			local anchor_screen_row = buffer_screen_row(win, anchor.row)
+			image_screen_row = anchor_screen_row and anchor_screen_row + anchor.offset or nil
+		end
+		if bounds and not scrolled_anchor and not image_screen_row and placement.reservation_row then
+			-- A summary can scroll away while some of its reserved virtual
+			-- rows remain visible. Recover the original (not shifted) origin.
+			local adjacent = screen_position(win, placement.reservation_row, 0)
+			if adjacent then
+				image_screen_row = adjacent.row + (placement.reservation_above and -(rows + 1) or 0)
+			end
+		end
+		if not width or not image_screen_row
+			or (not bounds and not image_fits_window_bottom(win, image_screen_row, height))
+		then
+			-- Fully offscreen anchors clear; returning reuses the same object.
 			pcall(function()
 				img:clear(true)
 			end)
@@ -942,7 +1061,13 @@ render_entry_image = function(buf, entry, win, img, refresh_reservation)
 		img.render_offset_top = 0
 		-- Foldtext does not expose the source indentation through screenpos.
 		local info = vim.fn.getwininfo(win)[1]
-		local absolute_x = info.wincol - 1 + (info.textoff or 0) + entry.indent
+		local absolute_x = info.wincol - 1 + (info.textoff or 0) + entry.indent - leftcol
+		if bounds and (absolute_x >= bounds.right or absolute_x + width <= bounds.left
+			or image_screen_row > bounds.bottom or image_screen_row + height <= bounds.top)
+		then
+			img:clear(true)
+			return
+		end
 		pcall(render, img, {
 			x = absolute_x,
 			y = image_screen_row,
