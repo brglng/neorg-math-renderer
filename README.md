@@ -145,8 +145,8 @@ All options (defaults shown):
     -- sizing is controlled by fit_window.
     scale = 1,
 
-    -- false: block images render at native pixel size, never scaled.
-    -- true:  downscale oversized block images to fit the window (never upscale).
+    -- false: block images retain their density-normalized size.
+    -- true:  window percentage caps can further downscale block images.
     -- This option does not affect inline images.
     fit_window = true,
 
@@ -315,7 +315,14 @@ wrapped in `\[ ... \]`.
   clipping. Short/wrapped adjacent lines and entire-buffer folds retain
   absolute placement.
   These fallbacks use the same terminal-cell sizing, `scale_factor`, and
-  native window/global caps as unfolded blocks. With image.nvim's `kitty`
+  native window/global caps as unfolded blocks. Block geometry is calibrated
+  to a reference terminal cell height of 40 pixels (20×40 in the test
+  geometry): the PNG's native pixel-to-cell size is multiplied by the current
+  cell height / 40, uniformly for both axes, before the native window/global
+  caps. This retains the reference display size at 20×40 and approximately
+  the same rows/columns at 10×20 without a new default size cap. It does not
+  detect OS DPI or change the cached PNG; image.nvim's explicit
+  `scale_factor` still applies. With image.nvim's `kitty`
   backend using normal placements (not `unicode-placeholders`), folded images
   are cropped at all content-window edges, including absolute fallbacks. The
   original image size, source PNG and reserved rows are retained; scrolling
@@ -323,8 +330,8 @@ wrapped in `\[ ... \]`.
   Other backends retain their previous clipping behavior: absolute fallbacks
   hide when their bottom edge cannot fit above the statusline.
   Resizing refreshes block geometry and reservations without
-  reconverting LaTeX. Cell density comes from image.nvim's terminal geometry,
-  not a hardcoded Retina/non-Retina DPI ratio.
+  reconverting LaTeX. Cell geometry comes from image.nvim's terminal query;
+  the 40-pixel calibration is not a physical-display DPI measurement.
 - Unloading or deleting the buffer (`:bd`, `:bunload`, `:bwipeout`) clears
   every image of that buffer, including absolute folded fallbacks, and drops
   its cached state; re-entering the buffer renders it fresh.
@@ -386,8 +393,9 @@ or physical display DPI. `test/sample.norg` provides formulas for live checks:
 3. Move the terminal between Retina/non-Retina displays or change its font,
    then resize it so image.nvim refreshes terminal geometry. Inspect
    `require("image/utils/term").get_size()` in Neovim and compare folded versus
-   unfolded formula size and reserved rows at both densities. If the terminal
-   does not report updated pixel geometry, this module cannot infer screen DPI.
+   unfolded formula size and reserved rows at both densities. Check that the
+   40-pixel reference looks right on the target display: if the terminal does
+   not report updated cell geometry, this module cannot infer screen DPI.
 4. Verify `hide_on_fold = true`, an outer section fold, and `:bd`/`:bunload`/
    `:bwipeout` (including a non-current split) still clear the appropriate images.
 

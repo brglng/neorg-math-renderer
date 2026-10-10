@@ -190,13 +190,24 @@ settle()
 vim.cmd("redraw!")
 img:render()
 settle()
-check("changed cell geometry refreshes folded scaling", img.last_paint.width == 48 and img.last_paint.height == 8)
-check("changed cell geometry refreshes reserved rows", entry.reservation_rows == 8 and reservation_height(buf, entry) == 8)
+check("non-Retina cell geometry preserves reference folded size", img.last_paint.width == native_width
+	and img.last_paint.height == native_height and native_width == 24 and native_height == 4)
+check("non-Retina geometry preserves reserved rows", entry.reservation_rows == 4 and reservation_height(buf, entry) == 4)
 vim.cmd("normal! zR")
 refresh(buf)
-check("unfolding clears explicit fallback size and restores binding", img.window == win and img.buffer == buf
-	and img.inline and img.geometry.width == nil and img.geometry.height == nil)
-check("density-changed folded/unfolded sizes agree", img.last_paint.width == 48 and img.last_paint.height == 8)
+check("unfolding refreshes normalized geometry and restores binding", img.window == win and img.buffer == buf
+	and img.inline and img.geometry.width == 24 and img.geometry.height == 4)
+check("non-Retina folded/unfolded sizes agree", img.last_paint.width == 24 and img.last_paint.height == 4)
+term.cell_width, term.cell_height = 20, 40
+vim.api.nvim_exec_autocmds("VimResized", {})
+img:render()
+settle()
+check("returning to Retina geometry preserves folded size", img.last_paint.width == 24
+	and img.last_paint.height == 4 and reservation_height(buf, entry) == 4)
+term.cell_width, term.cell_height = 10, 20
+vim.api.nvim_exec_autocmds("VimResized", {})
+img:render()
+settle()
 close_fold(buf, entry)
 
 -- Exercise image.nvim's real FocusLost/FocusGained handlers, not a custom
@@ -222,30 +233,33 @@ check("tmux return preserves fold position and indentation", img.last_paint.x ==
 -- system does not create the new split's image automatically.
 vim.wait(150, function() return false end)
 
--- Window caps can give the same PNG different heights in each split. The
--- shared reservation must equal their maximum, not the current image's height.
+-- Per-image native window caps can give the same PNG different heights in
+-- each split. The shared reservation must equal their maximum.
 vim.cmd("vsplit")
 local wider_win = vim.api.nvim_get_current_win()
-vim.api.nvim_win_set_width(win, 30)
+vim.api.nvim_win_set_width(win, 20)
 vim.api.nvim_set_current_win(win)
 refresh(buf)
+check("fit_window true keeps native window cap after normalization", entry.images[win].rendered_geometry.width == 20
+	and entry.images[win].rendered_geometry.height == 4)
+entry.images[win].max_height_window_percentage = 10
 vim.api.nvim_exec_autocmds("WinResized", {})
 vim.cmd("redraw!")
 local resize_ready = vim.wait(1000, function()
 	local narrow = entry.images[win]
 	local wider = entry.images[wider_win]
 	return narrow and wider and narrow.is_rendered and wider.is_rendered
-		and narrow.rendered_geometry.width == 30 and narrow.rendered_geometry.height == 5
-		and wider.rendered_geometry.width == 48 and wider.rendered_geometry.height == 8
+		and narrow.rendered_geometry.width == 12 and narrow.rendered_geometry.height == 2
+		and wider.rendered_geometry.width == 24 and wider.rendered_geometry.height == 4
 end)
 check("window resize completes both split renders", resize_ready)
 img = assert(entry.images[win])
 local wider_img = assert(entry.images[wider_win])
-check("folded fallback honors native fit_window caps", img.rendered_geometry.width == 30 and img.rendered_geometry.height == 5)
-check("wider split retains its native image height", wider_img.rendered_geometry.width == 48 and wider_img.rendered_geometry.height == 8)
+check("folded fallback honors native window caps", img.rendered_geometry.width == 12 and img.rendered_geometry.height == 2)
+check("wider split retains its normalized image height", wider_img.rendered_geometry.width == 24 and wider_img.rendered_geometry.height == 4)
 local max_height = math.max(img.rendered_geometry.height, wider_img.rendered_geometry.height)
 check("window resize refreshes reservations", reservation_height(buf, entry) == max_height
-	and entry.reservation_rows == max_height and max_height == 8)
+	and entry.reservation_rows == max_height and max_height == 4)
 check("window resize preserves chosen fold driver and outside anchor", entry.reservation_win == win
 	and entry.reservation_row == 4 and entry.reservation_above)
 local capped_width, capped_height = img.rendered_geometry.width, img.rendered_geometry.height
@@ -258,7 +272,7 @@ settle()
 -- A pending native transform must not repaint on completion after focus loss.
 local pending_buf, _, pending_entry, pending_img = seed({ "BEFORE", "    @math", "    x^2", "    @end", "", "NEXT" }, 1, 3, 4)
 close_fold(pending_buf, pending_entry)
-state.options.scale_factor = 0.61
+state.options.scale_factor = 0.81
 pending_img:clear(true)
 defer_transforms = true
 pending_img:render()
@@ -277,9 +291,37 @@ vim.api.nvim_exec_autocmds("FocusGained", {})
 vim.wait(150, function() return false end)
 pending_img = assert(pending_entry.images[vim.api.nvim_get_current_win()])
 check("image pending at focus loss returns without reconversion", pending_img.is_rendered and pending_entry.png == png)
-check("native scale_factor applies to reservations and folded size", pending_img.last_paint.width == 24
-	and pending_img.last_paint.height == 4 and reservation_height(pending_buf, pending_entry) == 4)
+check("explicit scale_factor composes with density normalization", pending_img.last_paint.width == 18
+	and pending_img.last_paint.height == 3 and reservation_height(pending_buf, pending_entry) == 3)
+term.cell_width, term.cell_height = 20, 40
+vim.api.nvim_exec_autocmds("VimResized", {})
+pending_img:render()
+settle()
+check("explicit scale_factor preserves same reference cells on Retina", pending_img.last_paint.width == 18
+	and pending_img.last_paint.height == 3 and reservation_height(pending_buf, pending_entry) == 3)
+term.cell_width, term.cell_height = 10, 20
+vim.api.nvim_exec_autocmds("VimResized", {})
+settle()
 state.options.scale_factor = 1
+
+-- fit_window=false must not revert to native 48-cell size at low density;
+-- only explicit user scaling or image.nvim caps should change the cell size.
+local uncapped_buf, _, uncapped_entry, uncapped_img = seed(
+	{ "BEFORE", "    @math", "    x^2", "    @end", "", "NEXT" }, 1, 3, 4, "below", false)
+check("fit_window false retains normalized unfolded cells", uncapped_img.last_paint.width == 24
+	and uncapped_img.last_paint.height == 4)
+close_fold(uncapped_buf, uncapped_entry)
+check("fit_window false retains normalized folded cells", uncapped_img.last_paint.width == 24
+	and uncapped_img.last_paint.height == 4 and reservation_height(uncapped_buf, uncapped_entry) == 4)
+term.cell_width, term.cell_height = 20, 40
+vim.api.nvim_exec_autocmds("VimResized", {})
+uncapped_img:render()
+settle()
+check("fit_window false preserves reference cells after density transition", uncapped_img.last_paint.width == 24
+	and uncapped_img.last_paint.height == 4 and reservation_height(uncapped_buf, uncapped_entry) == 4)
+term.cell_width, term.cell_height = 10, 20
+vim.api.nvim_exec_autocmds("VimResized", {})
+settle()
 
 -- Ordinary outside-fold anchors retain native buffer/window clipping. Above
 -- and below positions must keep source indentation and their reservation gap.
@@ -371,7 +413,7 @@ for _, position in ipairs({ "below", "above" }) do
 	refresh(buf)
 	check(position .. " horizontal scroll return restores native binding and full source", img.is_rendered
 		and entry.images[win] == img and img.window == win and img.buffer == buf and img.inline
-		and not img.math_renderer_absolute and img.geometry.width == nil and img.geometry.height == nil
+		and not img.math_renderer_absolute and img.geometry.width == 24 and img.geometry.height == 4
 		and img.last_display.x == info.wincol - 1 + (info.textoff or 0) + 4 and img.last_display.y == full_y
 		and img.last_display.payload.display_x == 0 and img.last_display.payload.display_width == 480
 		and img.last_display.payload.display_height == 160 and transforms == horizontal_transforms)
@@ -435,7 +477,7 @@ for _, position in ipairs({ "below", "above" }) do
 	refresh(buf)
 	check(position .. " short anchor return restores native full source", img.is_rendered and entry.images[win] == img
 		and img.window == win and img.buffer == buf and img.inline and not img.math_renderer_absolute
-		and img.geometry.width == nil and img.geometry.height == nil and img.last_display.y == full_y
+		and img.geometry.width == 24 and img.geometry.height == 4 and img.last_display.y == full_y
 		and img.last_display.payload.display_x == 0 and img.last_display.payload.display_width == 480
 		and img.last_display.payload.display_height == 160 and entry.reservation_id == reservation_id
 		and transforms == horizontal_transforms)
@@ -536,6 +578,9 @@ do
 	vim.api.nvim_buf_delete(other_buf, { force = true })
 end
 
+-- The following clipping checks exercise larger graphics payloads using an
+-- explicit user scale; normalization must not impose a default size cap.
+state.options.scale_factor = 2
 -- Global image.nvim caps are part of native size parity too.
 state.options.max_width = 20
 buf, win, entry, img = seed({ "BEFORE", "    @math", "    x^2", "    @end", "", "NEXT" }, 1, 3, 4)
@@ -767,6 +812,43 @@ for _, unsupported in ipairs({ "sixel", "unicode-placeholders" }) do
 end
 state.options.backend = "kitty"
 state.options.kitty_method = "normal"
+state.options.scale_factor = 1
+-- TabEnter must clear folded graphics even when a fallback has no native
+-- window binding. A delayed transform callback must not repaint a hidden tab.
+for _, lines in ipairs({
+	{ "BEFORE", "    @math", "    x^2", "    @end", "", "NEXT" },
+	{ "    @math", "    x^2", "    @end" },
+}) do
+	local whole_buffer = #lines == 3
+	buf, win, entry, img = seed(lines, whole_buffer and 0 or 1, whole_buffer and 2 or 3, 4)
+	close_fold(buf, entry)
+	check("tab regression starts with visible folded fallback", img.is_rendered and img.math_renderer_absolute)
+	local cached_png = entry.png
+	if whole_buffer then
+		state.options.scale_factor = 0.37
+		img:clear(true)
+		defer_transforms = true
+		img:render()
+		check("tab switch has a deferred native transform", #pending_transforms > 0)
+	end
+	vim.cmd("tabnew")
+	settle()
+	check("switching tabs clears folded fallback", not img.is_rendered and entry.images[win] == img)
+	local hidden_paints = paints
+	img:render()
+	for _, complete in ipairs(pending_transforms) do complete() end
+	pending_transforms = {}
+	settle()
+	check("native callback cannot repaint hidden-tab folded image", paints == hidden_paints and not img.is_rendered)
+	defer_transforms = false
+	vim.cmd("tabprevious")
+	vim.wait(150, function() return false end)
+	img = assert(entry.images[win])
+	check("returning to tab restores folded image without conversion", img.is_rendered
+		and entry.png == cached_png and conversions == 0)
+	state.options.scale_factor = 1
+	vim.cmd("tabonly")
+end
 buf, win, entry, img = seed({ "    @math", "    x^2", "    @end" }, 0, 2, 4)
 close_fold(buf, entry)
 local old_img = img

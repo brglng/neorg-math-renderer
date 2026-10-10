@@ -98,10 +98,9 @@ module.config.public = {
 	-- sizing remains controlled by `fit_window`.
 	scale = 1,
 
-	-- When false, block images render at native pixel size. When true
-	-- (default), oversized block images are scaled down to fit the window;
-	-- block images are never scaled up. This option does not affect inline
-	-- images.
+	-- When false, block images retain their density-normalized size. When
+	-- true (default), window percentage caps can further reduce their size.
+	-- This option does not affect inline images.
 	fit_window = true,
 
 	-- Foreground color: nil uses the current `@neorg.rendered.latex`
@@ -453,10 +452,11 @@ local function apply_inline_box_geometry(img, geometry)
 	end
 end
 
---- Match image.nvim's native block sizing before rendering. Reservations
---- cannot use the last rendered height: it can belong to a different cell
---- density/window size, or be absent while a transform is pending. Absolute
---- fold fallbacks also need these window caps, which detaching would bypass.
+--- Match image.nvim's cell sizing and caps, normalizing the PNG to the
+--- 40-pixel-high Retina cell used as the reference for block appearance.
+--- This is a calibration, not an OS DPI measurement or a maximum cell cap:
+--- native scale_factor still applies, and both dimensions scale uniformly.
+--- Reservations cannot use a previously rendered height across density changes.
 --- Inline `scale` is deliberately unrelated to this calculation.
 local function block_image_dimensions(img, win)
 	local ok, width, height = pcall(function()
@@ -468,7 +468,8 @@ local function block_image_dimensions(img, win)
 			return nil
 		end
 		local options = img.global_state and img.global_state.options or {}
-		local factor = type(options.scale_factor) == "number" and options.scale_factor or 1
+		local factor = (type(options.scale_factor) == "number" and options.scale_factor or 1)
+			* term.cell_height / 40
 		local columns = math.min(math.floor(img.image_width / term.cell_width * factor), term.screen_cols)
 		local rows = math.floor(img.image_height / term.cell_height * factor)
 		if not img.ignore_global_max_size then
@@ -955,6 +956,7 @@ end
 render_entry_image = function(buf, entry, win, img, refresh_reservation)
 	if image_render_inactive(img) or not entry.shown or entry.images[win] ~= img
 		or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf
+		or vim.api.nvim_win_get_tabpage(win) ~= vim.api.nvim_get_current_tabpage()
 		or not vim.api.nvim_buf_is_loaded(buf) or not buffer_position_valid(buf, entry.math_row)
 	then
 		pcall(function()
@@ -970,10 +972,10 @@ render_entry_image = function(buf, entry, win, img, refresh_reservation)
 	img.inline = img.math_renderer_inline
 	img.buffer = buf
 	img.math_renderer_absolute = false
-	-- An absolute fallback supplies explicit dimensions. Native rendering
-	-- must infer them afresh after returning to a buffer/window anchor.
-	img.geometry.width = nil
-	img.geometry.height = nil
+	-- Explicit dimensions keep native buffer/window rendering at the same
+	-- density-normalized size as absolute fallbacks and reservations. Recompute
+	-- on every pass so deferred native callbacks follow cell/scale changes.
+	img.geometry.width, img.geometry.height = block_image_dimensions(img, win)
 
 	local fold = entry_fold_info(entry, win)
 	if fold_hides_image(fold) then
@@ -2774,6 +2776,25 @@ module.load = function()
 		group = aug,
 		callback = function()
 			redraw_visible_buffers()
+		end,
+	})
+
+	-- Folded images can be rendered without a buffer/window binding, so
+	-- image.nvim's TabEnter cleanup cannot find them. Clear hidden-tab block
+	-- images before its deferred cleanup or a pending transform can repaint.
+	vim.api.nvim_create_autocmd("TabEnter", {
+		group = aug,
+		callback = function()
+			local current_tab = vim.api.nvim_get_current_tabpage()
+			for _, entries in pairs(module.private.blocks) do
+				for _, entry in pairs(entries) do
+					for win, img in pairs(entry.images) do
+						if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_tabpage(win) ~= current_tab then
+							img:clear(true)
+						end
+					end
+				end
+			end
 		end,
 	})
 
